@@ -1,0 +1,37 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Rabbit Ears — OpenRC init script.
+#
+# Runs the app under supervise-daemon, which respawns it on exit (SCOPE §4.7:
+# "mpv crash: the service supervisor restarts it, and the app re-tunes").
+#
+# Installed to /etc/init.d/rabbitears by alpine/setup.sh.
+
+name="rabbitears"
+description="Rabbit Ears kid-safe cable box (mpv + clock schedule + remote)"
+
+command="/sbin/supervise-daemon"
+# supervise-daemon takes the service name first (must match RC_SVCNAME), then
+# `--`, then the command to supervise (respawned on exit). Placeholder: no app
+# code yet, so this runs a no-op loop (keeps the service up without a respawn
+# storm). Replace the command once src/rabbitears/__main__.py is deployed:
+#   command_args="rabbitears -- /usr/bin/python3 -m rabbitears"
+command_args="rabbitears -- /bin/sh -c 'while :; do sleep 3600; done'"
+
+depend() {
+	need net
+	use dns
+}
+
+start() {
+	ebegin "starting ${name}"
+	start-stop-daemon --start --quiet --background --exec "${command}" -- ${command_args}
+	eend $?
+}
+
+stop() {
+	ebegin "stopping ${name}"
+	start-stop-daemon --stop --quiet --exec "${command}"
+	eend $?
+}

@@ -1,0 +1,28 @@
+# Rabbit Ears — authoritative package list (Alpine, x86_64).
+#
+# Source of truth for what the box installs. One package per line; a line
+# starting with `#` (or blank) is ignored. Read by alpine/setup.sh.
+#
+# Names verified against Alpine 3.24 (main + community) via `apk add --simulate`.
+
+# --- Playback: mpv + VAAPI hardware decode + DRM output (SCOPE §3, §4.3) ---
+mpv
+ffmpeg                # ffprobe for the indexer; mpv's decode backend
+libva-intel-driver    # Cherry Trail is Gen8 -> the i965 VAAPI driver
+libva-utils           # provides `vainfo` (M1 verifies VAAPI)
+
+# --- App runtime: Python + evdev remote (SCOPE §3, §4.4) ---
+python3
+py3-evdev
+
+# --- Fonts: blocky pixel font for the OSD (SCOPE §3). A bundled font in
+#     system/fonts/ may replace this later. ---
+font-terminus
+
+# --- System services (SCOPE §3) ---
+openssh               # dev access
+chrony                # correct time — the clock schedule depends on it
+alsa-utils            # amixer for volume/mute
+
+# --- Media library: the USB drive is exFAT (SCOPE §11; user chose exFAT) ---
+exfatprogs
