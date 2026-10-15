@@ -1,0 +1,54 @@
+# Rabbit Ears — setup-alpine answerfile (unattended base install)
+#
+# Used by:  setup-alpine -f /path/to/this/answerfile
+#
+# setup-alpine *sources* this file as a shell script, so each line sets an
+# option variable (verified against alpine-conf 3.22.0 / Alpine 3.24.2).
+# See docs/alpine-install.md for the full flow.
+#
+# Target: the KVM dev VM (4 vCPU / 2GB / 8GB IDE disk at /dev/sda).
+
+# --- Identity ---
+HOSTNAMEOPTS=rabbitears-vm
+
+# --- Timezone (set to your zone) ---
+TIMEZONEOPTS="US/Central"
+
+# --- Keyboard: none (headless VM; skips the kbd package on the 8GB disk) ---
+KEYMAPOPTS=none
+
+# --- Device manager ---
+DEVDOPTS=mdev
+
+# --- Network: DHCP on eth0 (the VM's e1000 NIC) ---
+INTERFACESOPTS="auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+"
+
+# --- Mirror: local caching proxy (host pulls from CDN, serves the VM fast).
+#     The proxy must be running before the install: sudo ./vm/provision.sh proxy
+#     (set to "-1" to use the public CDN directly if the proxy is unavailable) ---
+APKREPOSOPTS="http://192.168.122.1:8081/alpine"
+
+# --- NTP: chrony (the clock schedule depends on correct time) ---
+NTPOPTS="chrony"
+
+# --- Root: empty password (skips the interactive prompt; we use SSH key auth) ---
+empty_root_password=1
+
+# --- SSH: install sshd + authorize our key for root (passwordless for paramiko) ---
+SSHDOPTS=openssh
+ROOTSSHKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJSQW+AmYZr19+kfmvxo4o6dWaWpEbdD/8Z/48bBQS3a rabbitears-vm@michael-EVO-X2"
+
+# --- Disk: the VM's 8GB system disk (IDE -> /dev/sda), installed as a sys disk ---
+DISKOPTS="-m sys /dev/sda"
+# Auto-confirm the "erase this disk" prompt (setup-disk checks ERASE_DISKS).
+# Must be exported so setup-disk (a child of setup-alpine) inherits it.
+export ERASE_DISKS="/dev/sda"
+
+# --- No lbu / apk-cache on the VM (those are box/M1 concerns) ---
+LBUOPTS=none
+APKCACHEOPTS=none

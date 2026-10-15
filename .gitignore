@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Rabbit Ears — VM artifacts (large binaries, rebuilt by vm/provision.sh)
+vm/isos/
+vm/disks/
+# VM SSH keypair (private key is a secret; public key is in alpine/answerfile)
+vm/keys/

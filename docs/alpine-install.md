@@ -1,0 +1,139 @@
+# Alpine Install
+
+Two targets share the *software* procedure but differ in the *base* install:
+
+- **VM (dev)** — a standard Alpine install in the KVM VM. Zero-touch: one command.
+- **Box A/B (prod)** — a *diskless* Alpine install on the Wyse 3040's eMMC, state
+  persisted via `lbu`. This is the real appliance (milestone M1).
+
+Once the base OS is up, both get the identical Rabbit Ears stack from
+`alpine/setup.sh`. Only the base install differs (standard vs diskless).
+
+---
+
+## 1. VM — zero-touch install (dev)
+
+One command provisions the KVM VM, drives an unattended `setup-alpine` over the
+serial console, switches the VM to boot from disk, and verifies SSH:
+
+```sh
+sudo ./vm/provision.sh
+```
+
+What it does (idempotent, safe to re-run):
+
+1. Installs host packages (qemu, libvirt, `python3-paramiko`, `python3-serial`).
+2. Downloads + SHA256-verifies the pinned Alpine ISO (`vm/isos/`, git-ignored).
+3. Generates the VM SSH keypair (`vm/keys/`, git-ignored) and syncs the
+   answerfile's `ROOTSSHKEY` to it — so a fresh clone always matches.
+4. Creates the 8 GB disk and defines the domain (direct kernel boot + serial pty).
+5. Logs into the live system over serial, writes `alpine/answerfile`, and runs
+   `setup-alpine -f` unattended: empty root password, auto-confirmed disk erase
+   (`ERASE_DISKS`), and the SSH key baked in for passwordless root.
+6. Switches the domain to boot from disk and verifies SSH with the key.
+
+> **Speed:** the VM's e1000+NAT path to the public CDN is slow (~50 KB/s), while
+> the host pulls the CDN at several MB/s. Start the local caching proxy first so
+> the install (and every later `apk add`) is served over the local network:
+>
+> ```sh
+> sudo ./vm/provision.sh proxy
+> ```
+>
+> The answerfile points the VM's apk repo at the proxy (`192.168.122.1:8081`).
+> With the proxy, `apk update` is ~1 s and package installs are sub-second.
+
+### Subcommands
+
+```sh
+sudo ./vm/provision.sh                    # create + zero-touch install (default)
+sudo ./vm/provision.sh status             # VM + ISO + disk status
+sudo ./vm/provision.sh proxy              # start the local apk caching proxy
+sudo ./vm/provision.sh console            # dump the serial console (debugging)
+sudo ./vm/provision.sh console-cmd "<c>"  # run a command on the console, read result
+sudo ./vm/provision.sh diskboot           # boot the installed system (from disk)
+sudo ./vm/provision.sh liveboot           # boot the live ISO (to inspect the disk)
+sudo ./vm/provision.sh eject              # detach the ISO (boot from disk)
+sudo ./vm/provision.sh destroy            # destroy the VM + its disk
+```
+
+### SSH in
+
+```sh
+sg libvirt -c 'virsh domifaddr rabbitears-vm'    # get the IP
+ssh -i vm/keys/rabbitears-vm root@<vm-ip>        # key auth, no password
+```
+
+### Rebuild from scratch
+
+```sh
+sudo ./vm/provision.sh destroy && sudo ./vm/provision.sh
+```
+
+---
+
+## 2. Box — diskless install (prod, M1)
+
+Diskless = root runs in RAM, populated at boot from an `apkovl` (overlay) on a
+small eMMC partition. This is the fiddly, do-once part; the steps below are the
+shape of it — validate each on Box A and record the exact commands that worked.
+
+1. **Boot Box A from the Alpine ISO** (USB). You get a RAM root as `root`.
+2. **Partition the eMMC** — one small ext4 partition for boot + overlay:
+   ```sh
+   # e.g. on /dev/mmcblk0 (confirm the device first!)
+   parted /dev/mmcblk0 mkpart primary ext4 1MiB 1GiB
+   mkfs.ext4 /dev/mmcblk0p1
+   mount /dev/mmcblk0p1 /mnt
+   ```
+3. **Install the kernel + initramfs** to `/mnt/boot` (from the ISO's `/lib/modules`
+   and a generated initramfs that knows how to load the apkovl).
+4. **Set up the apkovl** with `lbu`:
+   ```sh
+   # point lbu at the overlay location on /mnt, then:
+   lbu include /opt/rabbitears
+   lbu commit
+   ```
+5. **Install a bootloader** (extlinux/syslinux) on the partition to boot the
+   kernel with the apkovl, then reboot into diskless mode.
+6. **Verify:** `lbu status` shows the overlay; the box boots to a RAM root with
+   `/etc` and packages from the overlay.
+
+> Reference: the official Alpine "diskless" guide. The exact partition sizes,
+> initramfs flags, and lbu config are version-sensitive — capture the working
+> values here once Box A is up so Box B is a copy, not a re-derivation.
+
+### The LBU checkpoint
+
+Once the base OS + Rabbit Ears stack are in place, cut a checkpoint so a rebuild
+is a restore, not a re-derivation:
+
+```sh
+lbu package          # → /root/lbu-<timestamp>.tar.gz (config + package list)
+```
+
+Store that tarball in the repo. A fresh box is then: base install + `lbu restore`.
+
+### What persists where (box)
+
+| Data | Location | How |
+|---|---|---|
+| OS config, packages, services | eMMC `apkovl` | `lbu commit` |
+| App code (`/opt/rabbitears`) | eMMC `apkovl` | `lbu include /opt/rabbitears` + `lbu commit` |
+| Fonts, `mpv.conf` | eMMC `apkovl` | under `/etc` or `lbu include` |
+| Media library | USB drive | plain files |
+| Runtime state (last channel, volume) | USB `/.rabbitears/state.json` | written by the app |
+| Schedule index (durations) | USB `/.rabbitears/index.json` | generated by the indexer |
+
+**Rule:** the app never writes to `/` at runtime. State goes to the USB drive;
+if the drive is absent, state is kept in memory only.
+
+---
+
+## 3. First-boot checklist (both targets)
+
+- [ ] `apk system update` is clean
+- [ ] `rc-service sshd status` → running (dev access)
+- [ ] `chrony` synced (correct time — the schedule depends on it)
+- [ ] `./alpine/setup.sh` ran clean (packages, `system/` config, `rc-update`, `lbu include`)
+- [ ] `rc-service rabbitears status` → the service is up (stub app for now)
