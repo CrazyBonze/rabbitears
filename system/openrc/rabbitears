@@ -6,32 +6,37 @@
 # Runs the app under supervise-daemon, which respawns it on exit (SCOPE §4.7:
 # "mpv crash: the service supervisor restarts it, and the app re-tunes").
 #
+# `supervisor=supervise-daemon` hands start/stop/status to OpenRC's framework
+# (supervise_start/stop/status in /usr/libexec/rc/sh/supervise-daemon.sh),
+# which invokes:  supervise-daemon <name> --start [opts] $command -- $command_args
+# So we only declare `command` + `command_args`, plus a start_pre() to prepare
+# the runtime dir. Do NOT define manual start()/stop() here — that is the
+# start-stop-daemon pattern and conflicts with the supervisor.
+#
 # Installed to /etc/init.d/rabbitears by alpine/setup.sh.
 
 name="rabbitears"
 description="Rabbit Ears kid-safe cable box (mpv + clock schedule + remote)"
 
-command="/sbin/supervise-daemon"
-# supervise-daemon takes the service name first (must match RC_SVCNAME), then
-# `--`, then the command to supervise (respawned on exit). Placeholder: no app
-# code yet, so this runs a no-op loop (keeps the service up without a respawn
-# storm). Replace the command once src/rabbitears/__main__.py is deployed:
-#   command_args="rabbitears -- /usr/bin/python3 -m rabbitears"
-command_args="rabbitears -- /bin/sh -c 'while :; do sleep 3600; done'"
+supervisor=supervise-daemon
+
+# The command to supervise (respawned on exit). Placeholder: no app code yet,
+# so this runs a no-op loop (keeps the service up without a respawn storm).
+# Replace once src/rabbitears/__main__.py is deployed to /opt/rabbitears:
+#   command="/usr/bin/python3"
+#   command_args="-m rabbitears"
+command="/bin/sh"
+command_args="-c 'while :; do sleep 3600; done'"
+
+# /run is a tmpfs (cleared at boot); the mpv JSON IPC socket lives at
+# /run/rabbitears/mpv.sock, so create the directory before the daemon starts.
+start_pre() {
+	install -d -m 0755 /run/rabbitears
+}
 
 depend() {
-	need net
-	use dns
-}
-
-start() {
-	ebegin "starting ${name}"
-	start-stop-daemon --start --quiet --background --exec "${command}" -- ${command_args}
-	eend $?
-}
-
-stop() {
-	ebegin "stopping ${name}"
-	start-stop-daemon --stop --quiet --exec "${command}"
-	eend $?
+	# 'use' (not 'need') so a failed network does not block the service
+	# (SCOPE Goal #2: zero-interaction recovery). The app plays local media
+	# and does not strictly require the network.
+	use net
 }
