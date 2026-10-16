@@ -161,5 +161,63 @@ class CmdSerialTest(unittest.TestCase):
         stdout.buffer.write.assert_called_once_with(b"ok\n")
 
 
+class ScreenshotTest(unittest.TestCase):
+    def test_run_screenshot_spawns_thread(self):
+        # The required case: mock the VNC connection, assert the thread was
+        # started (ran to completion) and the PNG path is correct.
+        frame = (10, 8, b"\x00" * (10 * 8 * 3))
+        with mock.patch.object(vmctl, "_grab_vnc_frame", return_value=frame) as grab, \
+                mock.patch.object(vmctl, "_save_png") as save_png:
+            t = vmctl.start_screenshot_thread("127.0.0.1", 5900, "vm/screenshot.png", 0.0)
+            t.join(timeout=5)
+        self.assertFalse(t.is_alive())  # thread started and finished
+        grab.assert_called_once_with("127.0.0.1", 5900)
+        save_png.assert_called_once_with("vm/screenshot.png", 10, 8, b"\x00" * (10 * 8 * 3))
+
+    def test_screenshot_worker_saves_png(self):
+        frame = (8, 6, b"\xab" * (8 * 6 * 3))
+        with mock.patch.object(vmctl, "_grab_vnc_frame", return_value=frame), \
+                mock.patch.object(vmctl, "_save_png") as save_png:
+            vmctl._screenshot_worker("127.0.0.1", 5900, "out.png", 0.0)
+        save_png.assert_called_once_with("out.png", 8, 6, b"\xab" * (8 * 6 * 3))
+
+    def test_screenshot_worker_warns_on_vnc_failure(self):
+        # Best-effort: a failed VNC grab logs a warning and never raises.
+        with mock.patch.object(vmctl, "_grab_vnc_frame", return_value=None), \
+                mock.patch.object(vmctl, "_save_png") as save_png, \
+                mock.patch.object(vmctl.sys, "stderr") as stderr:
+            vmctl._screenshot_worker("127.0.0.1", 5900, "out.png", 0.0)
+        save_png.assert_not_called()
+        stderr.write.assert_called()
+
+    def test_cmd_run_starts_screenshot_when_flagged(self):
+        args = SimpleNamespace(
+            disk="x.qcow2", host="127.0.0.1", port=4321,
+            screenshot=True, screenshot_out="vm/screenshot.png",
+            screenshot_delay=0.0, vnc_host="127.0.0.1", vnc_port=5900,
+        )
+        with mock.patch.object(vmctl, "Vm") as vm_cls, \
+                mock.patch.object(vmctl.signal, "signal"), \
+                mock.patch.object(vmctl, "_stream_serial"), \
+                mock.patch.object(vmctl, "start_screenshot_thread") as start_shot:
+            vm_cls.return_value.wait.return_value = 0
+            vmctl.cmd_run(args)
+        start_shot.assert_called_once_with("127.0.0.1", 5900, "vm/screenshot.png", 0.0)
+
+    def test_cmd_run_no_screenshot_when_unflagged(self):
+        args = SimpleNamespace(
+            disk="x.qcow2", host="127.0.0.1", port=4321,
+            screenshot=False, screenshot_out="vm/screenshot.png",
+            screenshot_delay=0.0, vnc_host="127.0.0.1", vnc_port=5900,
+        )
+        with mock.patch.object(vmctl, "Vm") as vm_cls, \
+                mock.patch.object(vmctl.signal, "signal"), \
+                mock.patch.object(vmctl, "_stream_serial"), \
+                mock.patch.object(vmctl, "start_screenshot_thread") as start_shot:
+            vm_cls.return_value.wait.return_value = 0
+            vmctl.cmd_run(args)
+        start_shot.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

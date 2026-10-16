@@ -111,6 +111,39 @@ down). Log in over the console as `root`.
 
 ---
 
+## Screenshot (visual confirmation)
+
+The serial console tells you the VM booted, but it can't tell you the GPU
+actually *rendered* a picture. `run --screenshot` closes that gap: a background
+thread grabs a single VNC framebuffer a few seconds after boot and saves it to a
+PNG, so you can open the file and confirm the display path produced something
+real (a desktop, a login screen, a playing video frame) instead of a black or
+garbled screen.
+
+```sh
+python3 vm/vmctl.py run --disk /path/to/rabbitears-vm.qcow2 --screenshot
+# -> saves vm/screenshot.png (override with --screenshot-out PATH)
+```
+
+- **What it's for:** a quick, eyeball-able proof that virtio-gpu is rendering.
+  It's a **best-effort diagnostic** — if the VNC grab fails (VM not up in time,
+  VNC not listening, auth hiccup), `vmctl` logs a warning to stderr and keeps
+  running the normal serial stream. It never crashes the run.
+- **How it works:** after a startup delay (`--screenshot-delay`, default 15s),
+  the thread connects to VNC on `127.0.0.1:5900`, grabs one framebuffer, and
+  writes a PNG (stdlib `zlib` — no image library needed).
+- **Dependency note:** the grab uses `pyvnc` if it's installed, and otherwise
+  falls back to a minimal built-in raw RFB framebuffer reader (no-auth /
+  empty-password). To use `pyvnc`, add it to the host environment:
+  ```sh
+  uv add pyvnc        # optional; the raw-RFB fallback works without it
+  ```
+  The VNC server itself is provided by QEMU — add `-vnc 127.0.0.1:5900` to the
+  qemu line (or run the VM under a tool that exposes VNC) for the grab to
+  connect. Without a VNC endpoint the screenshot is simply skipped.
+
+---
+
 ## Validation checklist (inside the VM)
 
 Once the VM is up (serial console or `ssh -p 2222 root@127.0.0.1`):
