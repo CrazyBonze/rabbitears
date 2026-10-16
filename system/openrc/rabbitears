@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/sbin/openrc-run
 # SPDX-License-Identifier: BSD-2-Clause
 #
 # Rabbit Ears — OpenRC init script.
