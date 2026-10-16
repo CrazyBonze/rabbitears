@@ -136,4 +136,34 @@ if the drive is absent, state is kept in memory only.
 - [ ] `rc-service sshd status` → running (dev access)
 - [ ] `chrony` synced (correct time — the schedule depends on it)
 - [ ] `./alpine/setup.sh` ran clean (packages, `system/` config, `rc-update`, `lbu include`)
-- [ ] `rc-service rabbitears status` → the service is up (stub app for now)
+- [ ] **Reboot** (not just `rc-service start`) — the service must come up through the real OpenRC boot sequence
+- [ ] `rc-service rabbitears status` → `started`
+- [ ] `/run/rabbitears/` exists (created by the init script's `start_pre()`)
+- [ ] `supervise-daemon` is running with the supervised process (check respawn: kill the child, it comes back)
+
+### The `rabbitears` service must boot (M1 gate)
+
+The whole M1 "base box" hinges on the `rabbitears` OpenRC service coming up at
+boot under `supervise-daemon` (respawn on crash, SCOPE §4.7). Verify it with a
+**real reboot**, because `rc-service start` in a live session does not exercise
+the boot path:
+
+```sh
+# 1. install the stack
+./alpine/setup.sh
+# 2. reboot (the real test)
+reboot
+# 3. after it's back up:
+rc-service rabbitears status      # → * status: started
+ls -ld /run/rabbitears            # → exists (start_pre ran)
+pgrep -af supervise-daemon        # → the supervisor + supervised process
+```
+
+> **Shebang gotcha (cost us a debugging session):** the init script's shebang
+> **must** be `#!/sbin/openrc-run`, not `#!/bin/sh`. `rc-service` hands off to
+> the shebang interpreter; `openrc-run` is what sources the OpenRC framework
+> (`openrc-run.sh`) and wires up the `supervisor=supervise-daemon` hook,
+> `start_pre()`, and the `start()`/`stop()` dispatch. With `#!/bin/sh` the
+> script runs as a plain shell — top-level code executes but `start()` is never
+> called and the service never starts (neither via `rc-service` nor at boot).
+> Every stock service (`sshd`, `chronyd`, …) uses `#!/sbin/openrc-run`; match it.
