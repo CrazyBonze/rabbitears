@@ -161,74 +161,22 @@ class CmdSerialTest(unittest.TestCase):
         stdout.buffer.write.assert_called_once_with(b"ok\n")
 
 
-class ScreenshotTest(unittest.TestCase):
-    def test_run_screenshot_spawns_thread(self):
-        # The required case: mock the VNC connection, assert the thread was
-        # started (ran to completion) and the PNG path is correct.
-        frame = (10, 8, b"\x00" * (10 * 8 * 3))
-        with mock.patch.object(vmctl, "_grab_vnc_frame", return_value=frame) as grab, \
-                mock.patch.object(vmctl, "_save_png") as save_png:
-            t = vmctl.start_screenshot_thread("127.0.0.1", 5900, "vm/screenshot.png", 0.0)
-            t.join(timeout=5)
-        self.assertFalse(t.is_alive())  # thread started and finished
-        grab.assert_called_once_with("127.0.0.1", 5900)
-        save_png.assert_called_once_with("vm/screenshot.png", 10, 8, b"\x00" * (10 * 8 * 3))
-
-    def test_screenshot_worker_saves_png(self):
-        frame = (8, 6, b"\xab" * (8 * 6 * 3))
-        with mock.patch.object(vmctl, "_grab_vnc_frame", return_value=frame), \
-                mock.patch.object(vmctl, "_save_png") as save_png:
-            vmctl._screenshot_worker("127.0.0.1", 5900, "out.png", 0.0)
-        save_png.assert_called_once_with("out.png", 8, 6, b"\xab" * (8 * 6 * 3))
-
-    def test_screenshot_worker_warns_on_vnc_failure(self):
-        # Best-effort: a failed VNC grab logs a warning and never raises.
-        with mock.patch.object(vmctl, "_grab_vnc_frame", return_value=None), \
-                mock.patch.object(vmctl, "_save_png") as save_png, \
-                mock.patch.object(vmctl.sys, "stderr") as stderr:
-            vmctl._screenshot_worker("127.0.0.1", 5900, "out.png", 0.0)
-        save_png.assert_not_called()
-        stderr.write.assert_called()
-
-    def test_cmd_run_starts_screenshot_when_flagged(self):
-        args = SimpleNamespace(
-            disk="x.qcow2", host="127.0.0.1", port=4321,
-            screenshot=True, screenshot_out="vm/screenshot.png",
-            screenshot_delay=0.0, vnc_host="127.0.0.1", vnc_port=5900,
-            monitor=None, display="none",
-        )
-        with mock.patch.object(vmctl, "Vm") as vm_cls, \
-                mock.patch.object(vmctl.signal, "signal"), \
-                mock.patch.object(vmctl, "_stream_serial"), \
-                mock.patch.object(vmctl, "start_screenshot_thread") as start_shot:
-            vm_cls.return_value.wait.return_value = 0
-            vmctl.cmd_run(args)
-        start_shot.assert_called_once_with("127.0.0.1", 5900, "vm/screenshot.png", 0.0)
-
-    def test_cmd_run_no_screenshot_when_unflagged(self):
-        args = SimpleNamespace(
-            disk="x.qcow2", host="127.0.0.1", port=4321,
-            screenshot=False, screenshot_out="vm/screenshot.png",
-            screenshot_delay=0.0, vnc_host="127.0.0.1", vnc_port=5900,
-            monitor=None, display="none",
-        )
-        with mock.patch.object(vmctl, "Vm") as vm_cls, \
-                mock.patch.object(vmctl.signal, "signal"), \
-                mock.patch.object(vmctl, "_stream_serial"), \
-                mock.patch.object(vmctl, "start_screenshot_thread") as start_shot:
-            vm_cls.return_value.wait.return_value = 0
-            vmctl.cmd_run(args)
-        start_shot.assert_not_called()
-
-
 class QmpScreendumpTest(unittest.TestCase):
-    def test_qemu_args_includes_qmp_socket(self):
-        args = vmctl.qemu_args(Path("disk.qcow2"), monitor_sock=Path("/tmp/qmp.sock"))
-        self.assertIn("-qmp", args)
-        self.assertIn("unix:/tmp/qmp.sock,server,nowait", args)
-
-    def test_qemu_args_no_monitor_by_default(self):
+    def test_qemu_args_monitor_default(self):
+        # No monitor_sock argument -> the default QMP socket is exposed.
         args = vmctl.qemu_args(Path("disk.qcow2"))
+        self.assertIn("-qmp", args)
+        self.assertIn("unix:/tmp/rabbitears-qmp.sock,server,nowait", args)
+
+    def test_qemu_args_monitor_override(self):
+        args = vmctl.qemu_args(Path("disk.qcow2"), monitor_sock=Path("/tmp/other.sock"))
+        self.assertIn("-qmp", args)
+        self.assertIn("unix:/tmp/other.sock,server,nowait", args)
+        self.assertNotIn("unix:/tmp/rabbitears-qmp.sock,server,nowait", args)
+
+    def test_qemu_args_monitor_disabled(self):
+        # Explicit None is the escape hatch for `--monitor ""`: no -qmp at all.
+        args = vmctl.qemu_args(Path("disk.qcow2"), monitor_sock=None)
         self.assertNotIn("-qmp", args)
 
     def test_qemu_args_display_none_default(self):
@@ -284,6 +232,28 @@ class QmpScreendumpTest(unittest.TestCase):
         with mock.patch.object(vmctl.socket, "socket", return_value=sock), \
                 self.assertRaises(RuntimeError):
             vmctl.screendump("/tmp/qmp.sock", "/tmp/frame.ppm")  # noqa: B108
+
+
+class TestPatternTest(unittest.TestCase):
+    def setUp(self):
+        tools_dir = Path(__file__).resolve().parent.parent / "tools"
+        self._old_path = sys.path[:]
+        sys.path.insert(0, str(tools_dir))
+        import generate_testpattern  # tools/generate_testpattern.py
+
+        self.gen = generate_testpattern
+
+    def tearDown(self):
+        sys.path[:] = self._old_path
+
+    def test_generate_testpattern(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "testpattern.png"
+            self.gen.generate(out)
+            self.assertTrue(out.exists())
+            data = out.read_bytes()
+            self.assertTrue(data.startswith(b"\x89PNG"))
+            self.assertGreater(len(data), 10 * 1024)  # not an empty card
 
 
 if __name__ == "__main__":

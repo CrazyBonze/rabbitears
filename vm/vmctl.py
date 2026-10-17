@@ -7,26 +7,26 @@ device, an SSH host-forward on 2222, and a TCP serial console on 4321.
 
 Subcommands:
 
-  vmctl.py run --disk DISK.qcow2 [--screenshot]
+  vmctl.py run --disk DISK.qcow2 [--monitor SOCK] [--display {none,spice}]
       Boot the VM and stream its serial console to stdout. Ctrl+C shuts the
-      VM down cleanly (SIGTERM, then SIGKILL) and exits 0. With --screenshot,
-      a background thread grabs a VNC framebuffer and saves it to a PNG
-      (best-effort — a VNC failure never crashes the run).
+      VM down cleanly (SIGTERM, then SIGKILL) and exits 0. A QMP monitor
+      socket is opened at /tmp/rabbitears-qmp.sock by default (override with
+      --monitor, disable with --monitor "") so `vmctl.py screenshot` works
+      out of the box.
 
   vmctl.py serial [--host H --port P]
       Attach to an already-running VM's serial console and forward bytes to
       stdout until the connection closes.
 
-  vmctl.py screenshot --monitor SOCK --out FILE.png
+  vmctl.py screenshot [--monitor SOCK] [--out FILE.png]
       Capture a PNG from an already-running VM via the QMP `screendump`
-      command on its monitor socket. Works headless (no VNC/SPICE needed).
-      Best-effort — any failure prints a warning and exits 0.
+      command on its monitor socket (default /tmp/rabbitears-qmp.sock).
+      Works headless (no VNC/SPICE needed). On success prints the saved path
+      and pixel dimensions; on failure prints a warning to stderr and exits 1.
 
-Stdlib only: socket, subprocess, signal, argparse, time, struct, zlib,
-threading, json. The optional VNC screenshot uses `pyvnc` if installed, else
-a minimal raw RFB framebuffer grab; the QMP screendump PPM->PNG conversion
-uses Pillow if installed, else ImageMagick's `convert`, else copies the PPM
-as-is. See vm/VAGRANT.md.
+Stdlib only: socket, subprocess, signal, argparse, time, json. The QMP
+screendump PPM->PNG conversion uses Pillow if installed, else ImageMagick's
+`convert`, else copies the PPM as-is. See vm/VAGRANT.md.
 """
 
 from __future__ import annotations
@@ -38,13 +38,10 @@ import json
 import shutil
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
-import threading
 import time
-import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,10 +51,8 @@ SSH_HOSTFWD = "tcp:127.0.0.1:2222-:22"
 QEMU_BIN = "qemu-system-x86_64"
 _RECV_SIZE = 4096
 _SERIAL_TIMEOUT = 0.1  # seconds between serial polls
-VNC_HOST = "127.0.0.1"
-VNC_PORT = 5900
+DEFAULT_MONITOR_SOCK = "/tmp/rabbitears-qmp.sock"
 DEFAULT_SCREENSHOT_OUT = "vm/screenshot.png"
-DEFAULT_SCREENSHOT_DELAY = 15.0  # seconds to let the VM render before the grab
 
 
 def qemu_args(
@@ -65,7 +60,7 @@ def qemu_args(
     *,
     mem: str = "2G",
     smp: str = "2",
-    monitor_sock: Path | None = None,
+    monitor_sock: Path | str | None = DEFAULT_MONITOR_SOCK,
     display: str = "none",
 ) -> list[str]:
     """Return the exact qemu-system-x86_64 argv for a validation VM.
@@ -74,8 +69,10 @@ def qemu_args(
     reproducible: virtio-gpu display, one user-mode netdev with an SSH
     host-forward, and a TCP serial server on 127.0.0.1:4321.
 
-    ``monitor_sock``: when set, exposes a QMP monitor on that Unix socket
+    ``monitor_sock``: exposes a QMP monitor on that Unix socket
     (``-qmp unix:<path>,server,nowait``) for headless `screendump`.
+    Defaults to ``/tmp/rabbitears-qmp.sock``; pass ``None`` explicitly to
+    omit the monitor entirely.
     ``display``: "none" (default) keeps ``-display none``; "spice" replaces
     it with a SPICE server on port 5910 plus the vdagent virtio-serial
     channel.
@@ -206,180 +203,6 @@ def _on_sigint(vm: Vm, signum, frame) -> None:
     raise SystemExit(0)
 
 
-# --- Screenshot (best-effort VNC framebuffer grab) -------------------------
-
-def _rfb_recv_exact(sock: socket.socket, n: int) -> bytes:
-    """Read exactly n bytes from sock, raising if the connection closes short."""
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("VNC connection closed")
-        buf += chunk
-    return bytes(buf)
-
-
-def _grab_vnc_frame_pyvnc(host: str, port: int, timeout: float):
-    """Grab a framebuffer via the optional `pyvnc` package; None on any failure."""
-    try:
-        import pyvnc  # optional dependency  # type: ignore[import-not-found]
-    except ImportError:
-        return None
-    client = None
-    try:
-        client = pyvnc.VNCClient(host, port, timeout=timeout)
-        client.connect()
-        screen = client.read_screen()  # best-effort; API varies by version
-        rgb = bytes(screen.rgb) if hasattr(screen, "rgb") else None
-        if rgb is None:
-            return None
-        return (int(screen.width), int(screen.height), rgb)
-    except Exception:  # noqa: BLE001 - optional path; fall back to raw RFB
-        return None
-    finally:
-        if client is not None:
-            with contextlib.suppress(Exception):
-                client.close()
-
-
-def _grab_vnc_frame_raw(host: str, port: int, timeout: float):
-    """Minimal raw RFB framebuffer grab (no-auth / empty-password VNCAuth).
-
-    Returns (width, height, rgb_bytes) or None on any failure. Deliberately
-    small — this is a diagnostic, not a VNC client.
-    """
-    try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-    except OSError:
-        return None
-    try:
-        sock.settimeout(timeout)
-        # 1. Version negotiation
-        if not _rfb_recv_exact(sock, 12).startswith(b"RFB"):
-            return None
-        sock.sendall(b"RFB 003.008\n")
-        # 2. Security handshake
-        n_types = _rfb_recv_exact(sock, 1)[0]
-        if n_types == 0:
-            return None
-        offered = _rfb_recv_exact(sock, n_types)
-        if 1 in offered:  # "none"
-            sock.sendall(b"\x01")
-        elif 2 in offered:  # VNCAuth with an empty password
-            sock.sendall(b"\x02")
-            _rfb_recv_exact(sock, 16)  # challenge
-            sock.sendall(bytes(16))  # empty password -> zero response
-        else:
-            return None
-        if _rfb_recv_exact(sock, 4)[0] != 0:  # security result
-            return None
-        # 3. ClientInit
-        _rfb_recv_exact(sock, 1)  # server shared-flag
-        sock.sendall(b"\x00")  # client: don't share
-        # 4. Request a 32-bit true-color format we can interpret (BGRX LE)
-        sock.sendall(
-            b"\x00\x00\x00\x00"
-            b"\x20\x18\x00\x01"
-            b"\x00\xff\x00\xff\x00\xff"
-            b"\x10\x08\x00"
-            b"\x00\x00\x00"
-        )
-        # 5. Raw encoding only
-        sock.sendall(b"\x02\x00\x00\x01\x00\x00\x00\x00")
-        # 6. FramebufferUpdateRequest for the whole screen
-        sock.sendall(b"\x03\x00\x00\x00" + struct.pack("!HHHH", 0, 0, 0xFFFF, 0xFFFF))
-        # 7. Read the update: type + padding + n_rects
-        header = _rfb_recv_exact(sock, 4)
-        if header[0] != 0:
-            return None
-        n_rects = struct.unpack("!H", header[2:4])[0]
-        if n_rects == 0:
-            return None
-        # First rectangle header
-        rect = _rfb_recv_exact(sock, 12)
-        x, y, w, h = struct.unpack("!HHHH", rect[:8])
-        encoding = struct.unpack("!I", rect[8:12])[0]
-        if encoding != 0 or w == 0 or h == 0:
-            return None
-        pixels = _rfb_recv_exact(sock, w * h * 4)
-    except (OSError, ConnectionError, struct.error):
-        return None
-    finally:
-        with contextlib.suppress(OSError):
-            sock.close()
-    # Convert BGRX (little-endian 32-bit) to RGB
-    rgb = bytearray(w * h * 3)
-    for i in range(w * h):
-        rgb[i * 3] = pixels[i * 4 + 2]      # R
-        rgb[i * 3 + 1] = pixels[i * 4 + 1]  # G
-        rgb[i * 3 + 2] = pixels[i * 4]      # B
-    return (w, h, bytes(rgb))
-
-
-def _grab_vnc_frame(host: str, port: int, timeout: float = 5.0):
-    """Grab one VNC framebuffer: pyvnc if available, else raw RFB. Best-effort."""
-    frame = _grab_vnc_frame_pyvnc(host, port, timeout)
-    if frame is not None:
-        return frame
-    return _grab_vnc_frame_raw(host, port, timeout)
-
-
-def _save_png(path: Path | str, width: int, height: int, rgb_bytes: bytes) -> None:
-    """Write an RGB image to a PNG using only stdlib (zlib + struct)."""
-
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        body = tag + data
-        return struct.pack("!I", len(data)) + body + struct.pack("!I", zlib.crc32(body))
-
-    stride = width * 3
-    raw = bytearray()
-    for y in range(height):
-        raw.append(0)  # per-scanline filter type: None
-        raw += rgb_bytes[y * stride:(y + 1) * stride]
-    ihdr = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    png = (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", ihdr)
-        + chunk(b"IDAT", zlib.compress(bytes(raw)))
-        + chunk(b"IEND", b"")
-    )
-    out = Path(path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(png)
-
-
-def _screenshot_worker(vnc_host: str, vnc_port: int, out_path: Path | str, startup_delay: float) -> None:
-    """Thread target: wait for the VM, grab a VNC frame, save a PNG.
-
-    Best-effort — any failure logs a warning and returns; it never crashes the run.
-    """
-    time.sleep(startup_delay)
-    try:
-        frame = _grab_vnc_frame(vnc_host, vnc_port)
-        if frame is None:
-            print("[vmctl] WARNING: VNC grab failed; no screenshot", file=sys.stderr)
-            return
-        width, height, rgb = frame
-        _save_png(out_path, width, height, rgb)
-        print(f"[vmctl] screenshot saved to {out_path}", file=sys.stderr)
-    except Exception as e:  # noqa: BLE001 - best-effort diagnostic, never fatal
-        print(f"[vmctl] WARNING: screenshot failed: {e}", file=sys.stderr)
-
-
-def start_screenshot_thread(
-    vnc_host: str, vnc_port: int, out_path: Path | str, startup_delay: float
-) -> threading.Thread:
-    """Start a daemon thread that grabs and saves a VNC screenshot. Returns it."""
-    t = threading.Thread(
-        target=_screenshot_worker,
-        args=(vnc_host, vnc_port, out_path, startup_delay),
-        name="vmctl-screenshot",
-        daemon=True,
-    )
-    t.start()
-    return t
-
-
 # --- Screenshot via QMP `screendump` (headless; no VNC/SPICE needed) ------
 
 def _qmp_read_message(sock: socket.socket) -> dict:
@@ -467,16 +290,28 @@ def ppm_to_png(ppm_path: Path | str, png_path: Path | str) -> None:
     png_path.write_bytes(ppm_path.read_bytes())
 
 
+def _ppm_dimensions(ppm_path: Path | str) -> tuple[int, int]:
+    """Read (width, height) from a binary PPM (P6) header: `P6\n<w> <h>\n<maxval>\n`."""
+    with open(ppm_path, "rb") as f:
+        header = f.read(64)
+    if not header.startswith(b"P6"):
+        raise ValueError(f"{ppm_path} is not a P6 PPM file")
+    width, height = (int(part) for part in header.split(b"\n")[1].split())
+    return width, height
+
+
 def cmd_screenshot(args: argparse.Namespace) -> int:
-    """QMP screendump against a running VM: PPM -> PNG. Best-effort."""
+    """QMP screendump against a running VM: PPM -> PNG. Exits 1 on failure."""
     tmpdir = Path(tempfile.mkdtemp(prefix="vmctl-shot-"))
     ppm = tmpdir / "frame.ppm"
     try:
         screendump(args.monitor, ppm)
+        width, height = _ppm_dimensions(ppm)
         ppm_to_png(ppm, args.out)
-        print(args.out)
-    except Exception as e:  # noqa: BLE001 - best-effort diagnostic, never fatal
+        print(f"screenshot saved: {args.out}  ({width}x{height})")
+    except Exception as e:  # noqa: BLE001 - diagnostic; report and fail
         print(f"[vmctl] WARNING: QMP screendump failed: {e}", file=sys.stderr)
+        return 1
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     return 0
@@ -497,10 +332,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     vm.run()
     signal.signal(signal.SIGINT, functools.partial(_on_sigint, vm))
-    if args.screenshot:
-        start_screenshot_thread(
-            args.vnc_host, args.vnc_port, args.screenshot_out, args.screenshot_delay
-        )
     try:
         _stream_serial(args.host, args.port, vm)
     finally:
@@ -538,27 +369,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--host", default=SERIAL_HOST, help="Serial console host")
     run_p.add_argument("--port", type=int, default=SERIAL_PORT, help="Serial console port")
     run_p.add_argument(
-        "--screenshot",
-        action="store_true",
-        help="Grab a VNC framebuffer and save it as a PNG (best-effort)",
-    )
-    run_p.add_argument(
-        "--screenshot-out",
-        default=DEFAULT_SCREENSHOT_OUT,
-        help=f"Output PNG path for --screenshot (default: {DEFAULT_SCREENSHOT_OUT})",
-    )
-    run_p.add_argument(
-        "--screenshot-delay",
-        type=float,
-        default=DEFAULT_SCREENSHOT_DELAY,
-        help="Seconds to wait for the VM to render before the screenshot",
-    )
-    run_p.add_argument("--vnc-host", default=VNC_HOST, help="VNC host for --screenshot")
-    run_p.add_argument("--vnc-port", type=int, default=VNC_PORT, help="VNC port for --screenshot")
-    run_p.add_argument(
         "--monitor",
-        default=None,
-        help="Path to the QMP Unix socket (e.g. /tmp/qmp.sock) for headless screendump",
+        default=DEFAULT_MONITOR_SOCK,
+        help=(
+            f"Path to the QMP Unix socket for headless screendump "
+            f"(default: {DEFAULT_MONITOR_SOCK}; pass --monitor '' to disable)"
+        ),
     )
     run_p.add_argument(
         "--display",
@@ -575,8 +391,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "screenshot",
         help="Capture a PNG from a running VM via QMP screendump (headless)",
     )
-    shot_p.add_argument("--monitor", required=True, help="Path to the running VM's QMP Unix socket")
-    shot_p.add_argument("--out", required=True, help="Output PNG path")
+    shot_p.add_argument(
+        "--monitor",
+        default=DEFAULT_MONITOR_SOCK,
+        help=f"Path to the running VM's QMP Unix socket (default: {DEFAULT_MONITOR_SOCK})",
+    )
+    shot_p.add_argument(
+        "--out",
+        default=DEFAULT_SCREENSHOT_OUT,
+        help=f"Output PNG path (default: {DEFAULT_SCREENSHOT_OUT})",
+    )
 
     return parser
 
