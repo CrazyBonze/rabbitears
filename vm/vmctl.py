@@ -17,9 +17,16 @@ Subcommands:
       Attach to an already-running VM's serial console and forward bytes to
       stdout until the connection closes.
 
+  vmctl.py screenshot --monitor SOCK --out FILE.png
+      Capture a PNG from an already-running VM via the QMP `screendump`
+      command on its monitor socket. Works headless (no VNC/SPICE needed).
+      Best-effort — any failure prints a warning and exits 0.
+
 Stdlib only: socket, subprocess, signal, argparse, time, struct, zlib,
-threading. The optional screenshot uses `pyvnc` if installed, else a minimal
-raw RFB framebuffer grab — see vm/VAGRANT.md.
+threading, json. The optional VNC screenshot uses `pyvnc` if installed, else
+a minimal raw RFB framebuffer grab; the QMP screendump PPM->PNG conversion
+uses Pillow if installed, else ImageMagick's `convert`, else copies the PPM
+as-is. See vm/VAGRANT.md.
 """
 
 from __future__ import annotations
@@ -27,11 +34,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import json
+import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zlib
@@ -50,14 +60,27 @@ DEFAULT_SCREENSHOT_OUT = "vm/screenshot.png"
 DEFAULT_SCREENSHOT_DELAY = 15.0  # seconds to let the VM render before the grab
 
 
-def qemu_args(disk: Path | str, *, mem: str = "2G", smp: str = "2") -> list[str]:
+def qemu_args(
+    disk: Path | str,
+    *,
+    mem: str = "2G",
+    smp: str = "2",
+    monitor_sock: Path | None = None,
+    display: str = "none",
+) -> list[str]:
     """Return the exact qemu-system-x86_64 argv for a validation VM.
 
     The flag list is fixed (see vm/VAGRANT.md) so the validation is
     reproducible: virtio-gpu display, one user-mode netdev with an SSH
     host-forward, and a TCP serial server on 127.0.0.1:4321.
+
+    ``monitor_sock``: when set, exposes a QMP monitor on that Unix socket
+    (``-qmp unix:<path>,server,nowait``) for headless `screendump`.
+    ``display``: "none" (default) keeps ``-display none``; "spice" replaces
+    it with a SPICE server on port 5910 plus the vdagent virtio-serial
+    channel.
     """
-    return [
+    args = [
         QEMU_BIN,
         "-m", mem,
         "-smp", smp,
@@ -68,8 +91,19 @@ def qemu_args(disk: Path | str, *, mem: str = "2G", smp: str = "2") -> list[str]
         "-netdev", f"user,id=net0,hostfwd={SSH_HOSTFWD}",
         "-device", "virtio-net-pci,netdev=net0",
         "-serial", f"tcp:{SERIAL_HOST}:{SERIAL_PORT},server,nowait",
-        "-display", "none",
     ]
+    if display == "spice":
+        args += [
+            "-spice", "port=5910,disable-ticketing=on",
+            "-device", "virtio-serial-pci",
+            "-chardev", "spicevmc,id=spicechannel0,name=vdagent",
+            "-device", "virtserialport,chardev=spicechannel0,name=com.redhat.spice.0",
+        ]
+    else:
+        args += ["-display", "none"]
+    if monitor_sock is not None:
+        args += ["-qmp", f"unix:{monitor_sock},server,nowait"]
+    return args
 
 
 @dataclass
@@ -82,10 +116,14 @@ class Vm:
 
     disk: Path
     proc: subprocess.Popen | None = field(default=None, repr=False, compare=False)
+    monitor_sock: Path | None = field(default=None, repr=False, compare=False)
+    display: str = "none"
 
     def run(self) -> None:
         """Spawn qemu-system-x86_64 with the fixed validation flag list."""
-        self.proc = subprocess.Popen(qemu_args(self.disk))
+        self.proc = subprocess.Popen(
+            qemu_args(self.disk, monitor_sock=self.monitor_sock, display=self.display)
+        )
 
     def wait(self, timeout: float | None = None) -> int:
         """Block until the VM exits; return its exit code (0 if never started)."""
@@ -342,9 +380,121 @@ def start_screenshot_thread(
     return t
 
 
+# --- Screenshot via QMP `screendump` (headless; no VNC/SPICE needed) ------
+
+def _qmp_read_message(sock: socket.socket) -> dict:
+    """Read one newline-delimited QMP JSON message from the monitor socket."""
+    line = b""
+    while not line.endswith(b"\n"):
+        chunk = sock.recv(1)
+        if not chunk:
+            raise ConnectionError("QMP connection closed before end of message")
+        line += chunk
+    try:
+        msg = json.loads(line)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"QMP: malformed JSON message: {e}") from e
+    if not isinstance(msg, dict):
+        raise RuntimeError(f"QMP: expected a JSON object, got {type(msg).__name__}")
+    return msg
+
+
+def _qmp_exchange(sock: socket.socket, command: str, arguments: dict | None = None) -> None:
+    """Send one QMP execute command and validate the return acknowledgement.
+
+    Raises RuntimeError on a non-empty ``error`` key or a reply without a
+    ``return`` key.
+    """
+    payload: dict = {"execute": command}
+    if arguments:
+        payload["arguments"] = arguments
+    sock.sendall((json.dumps(payload) + "\n").encode())
+    msg = _qmp_read_message(sock)
+    if msg.get("error"):
+        raise RuntimeError(f"QMP error for {command}: {msg['error']}")
+    if "return" not in msg:
+        raise RuntimeError(f"QMP: no 'return' in reply to {command}: {msg}")
+
+
+def screendump(monitor_sock: Path | str, output_path: Path | str) -> None:
+    """Capture the VM framebuffer to ``output_path`` via QMP ``screendump``.
+
+    Connects to the QMP socket at ``monitor_sock``, performs the handshake
+    (read greeting, ``qmp_capabilities``), then sends ``screendump`` with
+    ``filename``. QEMU writes the PPM file itself, so ``output_path`` must
+    be an absolute path the QEMU process can write.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(10.0)
+    try:
+        sock.connect(str(monitor_sock))
+        greeting = _qmp_read_message(sock)
+        if "QMP" not in greeting:
+            raise RuntimeError(f"QMP: bad server greeting: {greeting}")
+        _qmp_exchange(sock, "qmp_capabilities")
+        _qmp_exchange(sock, "screendump", {"filename": str(output_path)})
+    finally:
+        sock.close()
+
+
+def ppm_to_png(ppm_path: Path | str, png_path: Path | str) -> None:
+    """Convert QEMU's PPM screendump to a PNG. Never raises.
+
+    Tries Pillow, then ImageMagick's ``convert``; if neither is available
+    (or both fail), copies the PPM to ``png_path`` unchanged and prints a
+    warning to stderr.
+    """
+    ppm_path, png_path = Path(ppm_path), Path(png_path)
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from PIL import Image  # optional dependency  # type: ignore[import-not-found]
+
+        with Image.open(ppm_path) as img:
+            img.save(png_path)
+        return
+    except ImportError:
+        pass
+    except Exception as e:  # noqa: BLE001 - fall through to convert
+        print(f"[vmctl] WARNING: PIL PPM->PNG failed ({e}); trying convert", file=sys.stderr)
+    try:
+        subprocess.run(["convert", str(ppm_path), str(png_path)], check=True, capture_output=True)
+        return
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(
+            f"[vmctl] WARNING: convert failed ({e}); copying PPM as-is to {png_path}",
+            file=sys.stderr,
+        )
+    png_path.write_bytes(ppm_path.read_bytes())
+
+
+def cmd_screenshot(args: argparse.Namespace) -> int:
+    """QMP screendump against a running VM: PPM -> PNG. Best-effort."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="vmctl-shot-"))
+    ppm = tmpdir / "frame.ppm"
+    try:
+        screendump(args.monitor, ppm)
+        ppm_to_png(ppm, args.out)
+        print(args.out)
+    except Exception as e:  # noqa: BLE001 - best-effort diagnostic, never fatal
+        print(f"[vmctl] WARNING: QMP screendump failed: {e}", file=sys.stderr)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Boot the VM and stream its serial console; Ctrl+C exits cleanly."""
-    vm = Vm(disk=Path(args.disk))
+    if args.display == "spice":
+        print(
+            "[vmctl] SPICE display on port 5910 — connect with: "
+            "spicy --host=127.0.0.1 --port=5910",
+            file=sys.stderr,
+        )
+    vm = Vm(
+        disk=Path(args.disk),
+        monitor_sock=Path(args.monitor) if args.monitor else None,
+        display=args.display,
+    )
     vm.run()
     signal.signal(signal.SIGINT, functools.partial(_on_sigint, vm))
     if args.screenshot:
@@ -405,10 +555,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument("--vnc-host", default=VNC_HOST, help="VNC host for --screenshot")
     run_p.add_argument("--vnc-port", type=int, default=VNC_PORT, help="VNC port for --screenshot")
+    run_p.add_argument(
+        "--monitor",
+        default=None,
+        help="Path to the QMP Unix socket (e.g. /tmp/qmp.sock) for headless screendump",
+    )
+    run_p.add_argument(
+        "--display",
+        choices=["none", "spice"],
+        default="none",
+        help="Display device: none (default) or spice (SPICE server on port 5910)",
+    )
 
     ser_p = sub.add_parser("serial", help="Attach to a running VM's serial console")
     ser_p.add_argument("--host", default=SERIAL_HOST, help="Serial console host")
     ser_p.add_argument("--port", type=int, default=SERIAL_PORT, help="Serial console port")
+
+    shot_p = sub.add_parser(
+        "screenshot",
+        help="Capture a PNG from a running VM via QMP screendump (headless)",
+    )
+    shot_p.add_argument("--monitor", required=True, help="Path to the running VM's QMP Unix socket")
+    shot_p.add_argument("--out", required=True, help="Output PNG path")
 
     return parser
 
@@ -419,6 +587,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(args)
     if args.command == "serial":
         return cmd_serial(args)
+    if args.command == "screenshot":
+        return cmd_screenshot(args)
     return 2  # pragma: no cover - argparse enforces a valid subcommand
 
 

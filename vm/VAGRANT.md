@@ -144,6 +144,47 @@ python3 vm/vmctl.py run --disk /path/to/rabbitears-vm.qcow2 --screenshot
 
 ---
 
+## Taking a screenshot via QMP (headless)
+
+The QMP `screendump` path works without a VNC or SPICE display window. Boot with
+`--monitor` and optionally `--screenshot` to capture automatically at shutdown:
+
+```sh
+# Terminal 1: boot with a QMP socket
+python3 vm/vmctl.py run --disk /path/to/rabbitears-vm.qcow2 \
+    --monitor /tmp/qmp.sock
+
+# Terminal 2: grab a frame from the running VM
+python3 vm/vmctl.py screenshot --monitor /tmp/qmp.sock --out /tmp/screen.png
+```
+
+QEMU writes a PPM framebuffer; `vmctl` converts it to PNG automatically (using
+Pillow if available, otherwise ImageMagick's `convert`, otherwise copies the PPM
+as-is). Unlike the VNC grab, this path does not require a VNC port and works even
+when `-display none` is in effect.
+
+---
+
+## Live display with SPICE
+
+Boot with `--display spice` to open a SPICE server on port 5910 and watch the
+VM output live:
+
+```sh
+python3 vm/vmctl.py run --disk /path/to/rabbitears-vm.qcow2 --display spice
+
+# From another terminal (or after connecting over SSH):
+spicy --host=127.0.0.1 --port=5910
+# or
+virt-viewer spice://127.0.0.1:5910
+```
+
+The SPICE server is on localhost only and requires no password
+(`disable-ticketing=on`). Combine with `--monitor /tmp/qmp.sock` to get both
+a live view and the QMP screendump capability.
+
+---
+
 ## Validation checklist (inside the VM)
 
 Once the VM is up (serial console or `ssh -p 2222 root@127.0.0.1`):

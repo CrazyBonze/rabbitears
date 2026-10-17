@@ -26,3 +26,7 @@ alsa-utils            # amixer for volume/mute
 
 # --- Media library: the USB drive is exFAT (SCOPE §11; user chose exFAT) ---
 exfatprogs
+
+# --- VM only: mesa drivers for virtio-gpu (not needed on the Wyse 3040) ---
+mesa-dri-gallium      # virtio-gpu DRM/GL driver
+mesa-gl               # OpenGL runtime for mpv --vo=gpu inside the VM

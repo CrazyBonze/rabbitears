@@ -27,7 +27,6 @@ VM_VCPUS=4
 VM_RAM_MB=2048
 VM_DISK_GB=8
 VM_NET="default"          # libvirt NAT network
-VM_VNC_PORT=5900
 
 # ---------------------------------------------------------------------------
 # Locations
@@ -147,8 +146,16 @@ if [ "$cmd" = "diskboot" ]; then
     </disk>
     <serial type='pty'><target port='0'/></serial>
     <input type='tablet' bus='usb'/>
-    <graphics type='vnc' port='-1' listen='0.0.0.0'/>
-    <video><model type='cirrus' vram='16384' heads='1'/></video>
+    <graphics type='spice' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+      <image compression='off'/>
+    </graphics>
+    <video>
+      <model type='virtio' heads='1' primary='yes'/>
+    </video>
+    <channel type='spicevmc'>
+      <target type='virtio' name='com.redhat.spice.0'/>
+    </channel>
     <interface type='network'>
       <source network='${VM_NET}'/>
       <model type='e1000'/>
@@ -198,8 +205,16 @@ if [ "$cmd" = "liveboot" ]; then
     </disk>
     <serial type='pty'><target port='0'/></serial>
     <input type='tablet' bus='usb'/>
-    <graphics type='vnc' port='-1' listen='0.0.0.0'/>
-    <video><model type='cirrus' vram='16384' heads='1'/></video>
+    <graphics type='spice' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+      <image compression='off'/>
+    </graphics>
+    <video>
+      <model type='virtio' heads='1' primary='yes'/>
+    </video>
+    <channel type='spicevmc'>
+      <target type='virtio' name='com.redhat.spice.0'/>
+    </channel>
     <interface type='network'>
       <source network='${VM_NET}'/>
       <model type='e1000'/>
@@ -277,7 +292,7 @@ if ! dpkg -s qemu-system-x86 >/dev/null 2>&1; then
   apt-get update -qq
   apt-get install -y -qq \
     qemu-system-x86 libvirt-daemon-system libvirt-clients virtinst \
-    usbutils bridge-utils dnsmasq sshpass vinagre
+    usbutils bridge-utils dnsmasq sshpass virt-viewer spice-client-gtk
 else
   log "Host packages already present."
 fi
@@ -409,9 +424,21 @@ if ! virsh list --all --name 2>/dev/null | grep -qx "$VM_NAME"; then
       <readonly/>
     </disk>
     <serial type='pty'><target port='0'/></serial>
+    <channel type='unix'>
+      <source mode='bind' path='/tmp/rabbitears-qmp.sock'/>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
     <input type='tablet' bus='usb'/>
-    <graphics type='vnc' port='-1' listen='0.0.0.0'/>
-    <video><model type='cirrus' vram='16384' heads='1'/></video>
+    <graphics type='spice' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+      <image compression='off'/>
+    </graphics>
+    <video>
+      <model type='virtio' heads='1' primary='yes'/>
+    </video>
+    <channel type='spicevmc'>
+      <target type='virtio' name='com.redhat.spice.0'/>
+    </channel>
     <interface type='network'>
       <source network='${VM_NET}'/>
       <model type='e1000'/>
@@ -443,7 +470,6 @@ cat <<EOF
  Next:
    1. Find the IP:   sg libvirt -c 'virsh domifaddr ${VM_NAME}'
    2. SSH in:        ssh -i vm/keys/rabbitears-vm root@<vm-ip>
-   3. Rabbit Ears stack:  ./alpine/deploy.sh <vm-ip>
-   (VNC is still at localhost:${VM_VNC_PORT} if you want to look.)
+   3. Watch it:   virt-viewer --connect qemu:///system ${VM_NAME}
 ============================================================
 EOF

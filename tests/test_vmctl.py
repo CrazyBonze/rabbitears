@@ -195,6 +195,7 @@ class ScreenshotTest(unittest.TestCase):
             disk="x.qcow2", host="127.0.0.1", port=4321,
             screenshot=True, screenshot_out="vm/screenshot.png",
             screenshot_delay=0.0, vnc_host="127.0.0.1", vnc_port=5900,
+            monitor=None, display="none",
         )
         with mock.patch.object(vmctl, "Vm") as vm_cls, \
                 mock.patch.object(vmctl.signal, "signal"), \
@@ -209,6 +210,7 @@ class ScreenshotTest(unittest.TestCase):
             disk="x.qcow2", host="127.0.0.1", port=4321,
             screenshot=False, screenshot_out="vm/screenshot.png",
             screenshot_delay=0.0, vnc_host="127.0.0.1", vnc_port=5900,
+            monitor=None, display="none",
         )
         with mock.patch.object(vmctl, "Vm") as vm_cls, \
                 mock.patch.object(vmctl.signal, "signal"), \
@@ -217,6 +219,71 @@ class ScreenshotTest(unittest.TestCase):
             vm_cls.return_value.wait.return_value = 0
             vmctl.cmd_run(args)
         start_shot.assert_not_called()
+
+
+class QmpScreendumpTest(unittest.TestCase):
+    def test_qemu_args_includes_qmp_socket(self):
+        args = vmctl.qemu_args(Path("disk.qcow2"), monitor_sock=Path("/tmp/qmp.sock"))
+        self.assertIn("-qmp", args)
+        self.assertIn("unix:/tmp/qmp.sock,server,nowait", args)
+
+    def test_qemu_args_no_monitor_by_default(self):
+        args = vmctl.qemu_args(Path("disk.qcow2"))
+        self.assertNotIn("-qmp", args)
+
+    def test_qemu_args_display_none_default(self):
+        args = vmctl.qemu_args(Path("disk.qcow2"))
+        self.assertIn("-display", args)
+        self.assertIn("none", args)
+
+    def test_qemu_args_display_spice(self):
+        args = vmctl.qemu_args(Path("disk.qcow2"), display="spice")
+        self.assertIn("-spice", args)
+        self.assertIn("port=5910,disable-ticketing=on", args)
+        self.assertIn("-device", args)
+        self.assertIn("virtio-serial-pci", args)
+        self.assertIn("-chardev", args)
+        self.assertIn("spicevmc,id=spicechannel0,name=vdagent", args)
+        self.assertIn("virtserialport,chardev=spicechannel0,name=com.redhat.spice.0", args)
+        # -display none must be absent in spice mode
+        self.assertNotIn("-display", args)
+        self.assertNotIn("none", args)
+
+    def _mock_qmp_socket(self, messages: list[bytes]):
+        """Build a mock socket whose recv() feeds one byte at a time from messages."""
+        sock = mock.Mock()
+        stream = b"".join(messages)
+        pos = 0
+
+        def recv(n: int) -> bytes:
+            nonlocal pos
+            chunk = stream[pos:pos + n]
+            pos += n
+            return chunk
+
+        sock.recv.side_effect = recv
+        return sock
+
+    def test_screendump_sends_correct_qmp_sequence(self):
+        greeting = b'{"QMP": {"version": {"qemu": {"micro": 0, "minor": 2, "major": 8}}, "capabilities": ["oob"]}}\n'
+        ack = b'{"return": {}}\n'
+        sock = self._mock_qmp_socket([greeting, ack, ack])
+        with mock.patch.object(vmctl.socket, "socket", return_value=sock):
+            vmctl.screendump("/tmp/qmp.sock", "/tmp/frame.ppm")  # noqa: B108
+        sent = [c.args[0].decode() for c in sock.sendall.call_args_list]
+        self.assertIn("qmp_capabilities", sent[0])
+        self.assertIn("screendump", sent[1])
+        self.assertIn("/tmp/frame.ppm", sent[1])  # noqa: B108
+        sock.connect.assert_called_once_with("/tmp/qmp.sock")  # noqa: B108
+
+    def test_screendump_raises_on_protocol_error(self):
+        greeting = b'{"QMP": {"version": {}, "capabilities": []}}\n'
+        ack = b'{"return": {}}\n'
+        err = b'{"error": {"class": "CommandNotFound", "desc": "screendump"}}\n'
+        sock = self._mock_qmp_socket([greeting, ack, err])
+        with mock.patch.object(vmctl.socket, "socket", return_value=sock), \
+                self.assertRaises(RuntimeError):
+            vmctl.screendump("/tmp/qmp.sock", "/tmp/frame.ppm")  # noqa: B108
 
 
 if __name__ == "__main__":
