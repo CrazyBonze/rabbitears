@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # TEMPORARY setup helper — safe to delete once the QMP screendump validation
-# is done. Installs a narrow sudoers rule allowing ONLY
-# /home/michael/rabbitears/vm/export-disk.sh to run passwordless, so the
-# unprivileged QMP-screendump flow can boot a *copy* of the VM disk.
+# is done. Installs a narrow sudoers rule allowing ONLY this checkout's
+# vm/export-disk.sh (path derived from the script's own location) to run
+# passwordless, so the unprivileged QMP-screendump flow can boot a *copy*
+# of the VM disk.
 #
 # Usage:
 #   sudo vm/setup-export-sudoers.sh
