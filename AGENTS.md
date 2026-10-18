@@ -9,6 +9,7 @@ Kid-safe "cable box" for a Dell Wyse 3040: Alpine (diskless + lbu), OpenRC, one 
   - Extra args are appended to the task's main `cmd` only, never to its `pre_`/`post_` hooks.
 - Tests: `uv run task test`. 4 skips in `test_player.IntegrationStubs` are expected (they need a real mpv).
 - Single test: `uv run task unit tests.test_schedule.ComputePositionTest.test_basic_position_within_loop`
+- **Deploying to a target:** `uv run task deploy-vm` (VM) or `uv run task deploy-box --host H` (box) is the **only** way to change a target. SSH into a target is for read-only inspection and deliberate test actions, not config changes. `uv run task vm-verify` reporting `DRIFT` means someone hand-edited the target: fix the repo and redeploy.
 - **Adding a task:**
   - Every host-side script that people run repeatedly gets a task with a `help` string.
   - Tasks that change a target (VM/box) must call the idempotent repo scripts (`provision.sh`, `deploy.sh` → `setup.sh`).
@@ -48,14 +49,16 @@ Kid-safe "cable box" for a Dell Wyse 3040: Alpine (diskless + lbu), OpenRC, one 
 
 - Host must be Debian/Ubuntu (`provision.sh` installs qemu/libvirt with `apt`) with `/dev/kvm`.
 - **One-time per clone:** `uv run task setup-sudoers` (asks for the password once). It installs NOPASSWD rules in `/etc/sudoers.d/rabbitears` for this checkout's `vm/provision.sh` and `vm/make-usb.sh`, the only scripts that need root. Re-run it after moving the repo. If a root script prompts for a password, this hasn't been run: ask the user to run it.
-- `uv run task vm-build` builds the KVM VM via libvirt and an unattended `setup-alpine` (`vm/provision.sh` → `vm/install.py`).
+- **The loop:** `uv run task vm-build` (build; leaves the disk at rest) → `uv run task vm-run` (boot in QEMU) → `uv run task deploy-vm` (deploy + reboot + verify) → `uv run task vm-shot` (screenshot).
+- `uv run task vm-build` builds the KVM VM via libvirt and an unattended `setup-alpine` (`vm/provision.sh` → `vm/install.py`). It leaves the domain shut off so `vmctl.py` can open the disk.
   - Its `pre_` hook starts the apk caching proxy (`vm-proxy`). The answerfile points apk at `192.168.122.1:8081`; the public CDN over the VM's NAT is very slow.
   - `uv run task vm-rebuild` = destroy + build, which is the reproducibility check.
+  - Re-running `vm-build` on an already-installed VM is a no-op ("already installed").
 - **Never prefix `provision.sh` with `sudo`.** It self-elevates, and the rule above makes that passwordless. The same applies to `make-usb.sh`.
-- `provision.sh` subcommands without a task: `console`, `console-cmd`, `diskboot`, `liveboot`, `eject`, `destroy`.
+- `provision.sh` subcommands without a task: `console`, `console-cmd`, `diskboot`, `liveboot`, `eject`, `destroy`. (`stop` has a task: `uv run task vm-stop`.)
 - `provision.sh` generates `vm/keys/rabbitears-vm` (gitignored) and rewrites `ROOTSSHKEY` in `alpine/answerfile`, so a diff there after provisioning is expected.
-- `vm/vmctl.py` (tasks `vm-run`, `vm-serial`, `vm-shot`) boots the same qcow2 in a raw QEMU: SSH on `127.0.0.1:2222`, serial on `:4321`, QMP at `/tmp/rabbitears-qmp.sock`.
-  - It can't run while the libvirt domain holds the disk.
+- `vm/vmctl.py` (tasks `vm-run`, `vm-serial`, `vm-shot`) boots the same qcow2 in a raw QEMU (4 vCPU, 2 GB): SSH on `127.0.0.1:2222`, serial on `:4321`, QMP at `/tmp/rabbitears-qmp.sock`. The disk path defaults to the libvirt image; no `--disk` argument needed.
+  - It can't run while the libvirt domain holds the disk. Preflight checks for this and tells you to run `uv run task vm-stop`.
   - `screenshot` writes `vm/screenshot.png`, which is tracked; don't commit incidental changes to it.
 - For any other root command, ask the user. Don't add sudoers rules, setuid bits, or disk-copy workarounds. A new script that needs root goes in `SCRIPTS` in `vm/setup-sudoers.sh`, and the user re-runs it.
 

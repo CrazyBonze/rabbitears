@@ -33,7 +33,7 @@ class VmRunTest(unittest.TestCase):
             expected = [
                 "qemu-system-x86_64",
                 "-m", "2G",
-                "-smp", "2",
+                "-smp", "4",
                 "-cpu", "max,kvm=on",
                 "-enable-kvm",
                 "-drive", f"file={disk},if=virtio,format=qcow2",
@@ -48,6 +48,49 @@ class VmRunTest(unittest.TestCase):
                 vm.run()
             popen.assert_called_once()
             self.assertEqual(popen.call_args[0][0], expected)
+
+    def test_run_disk_defaults_to_libvirt_image(self):
+        # The --disk argument defaults to the libvirt image path.
+        self.assertEqual(vmctl.DEFAULT_DISK, "/var/lib/libvirt/images/rabbitears-vm.qcow2")
+        parser = vmctl._build_parser()
+        args = parser.parse_args(["run"])
+        self.assertEqual(args.disk, vmctl.DEFAULT_DISK)
+
+
+class PreflightTest(unittest.TestCase):
+    def test_preflight_refuses_when_libvirt_domain_running(self):
+        """preflight exits 1 when virsh reports the domain as running."""
+        disk = Path("/var/lib/libvirt/images/rabbitears-vm.qcow2")
+        fake_run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="running\n"))
+        fake_access = mock.Mock(return_value=True)
+        with self.assertRaises(SystemExit) as ctx:
+            vmctl.preflight(disk, run=fake_run, access=fake_access)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_preflight_skips_domain_check_when_virsh_missing(self):
+        """preflight skips the domain check when virsh is not found."""
+        disk = Path("/var/lib/libvirt/images/rabbitears-vm.qcow2")
+        fake_run = mock.Mock(side_effect=FileNotFoundError("virsh not found"))
+        fake_access = mock.Mock(return_value=True)
+        # Should not raise — virsh missing is OK, disk is writable.
+        vmctl.preflight(disk, run=fake_run, access=fake_access)
+
+    def test_preflight_refuses_unwritable_disk(self):
+        """preflight exits 1 when the disk is not readable/writable."""
+        disk = Path("/var/lib/libvirt/images/rabbitears-vm.qcow2")
+        fake_run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="shut off\n"))
+        fake_access = mock.Mock(return_value=False)
+        with self.assertRaises(SystemExit) as ctx:
+            vmctl.preflight(disk, run=fake_run, access=fake_access)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_preflight_passes_when_domain_off_and_disk_writable(self):
+        """preflight passes when the domain is shut off and the disk is writable."""
+        disk = Path("/var/lib/libvirt/images/rabbitears-vm.qcow2")
+        fake_run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="shut off\n"))
+        fake_access = mock.Mock(return_value=True)
+        # Should not raise.
+        vmctl.preflight(disk, run=fake_run, access=fake_access)
 
 
 class VmWaitTest(unittest.TestCase):

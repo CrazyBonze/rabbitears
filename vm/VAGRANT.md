@@ -1,42 +1,44 @@
-# Rabbit Ears — virtio-gpu validation VM
+# Rabbit Ears — dev VM
 
-A throwaway QEMU VM whose single job is to **prove the video path works
-before we commit to it on the real Wyse 3040.** The 3040 has no discrete GPU;
-it renders through the integrated Cherry Trail (Gen8) i965 driver over VAAPI.
-We want to be sure that an `mpv` output driven by a **virtio-gpu** display
-device (the closest thing to the 3040's path we can stand up on a dev box)
-actually decodes and shows a 720p H.264 file — *before* we wire it into the
-production box and discover it doesn't.
+A KVM VM that mirrors the Wyse 3040 (4 vCPU, 2 GB RAM, 8 GB disk) for
+developing and validating the Rabbit Ears stack before touching a real box.
 
-This is a **validation** VM, not the install VM. The unattended Alpine install
-(live ISO, direct kernel boot, libvirt domain) lives in `vm/provision.sh` +
-`vm/install.py` — see `docs/alpine-install.md`. This VM boots an *already
-installed* disk image with a fixed, minimal device set.
+**What it validates:** the DRM/KMS output path (`mpv --vo=gpu`), the app,
+OpenRC wiring, and media handling. **What it does NOT validate:** hardware
+decode (VAAPI/i965). virtio-gpu has no VAAPI driver, so hwdec is checked only
+on the real 3040 (M1). The VM decodes in software; non-compliant media
+"works" here but would fail on the 3040.
 
 ---
 
-## What it validates
+## The loop
 
-- `virtio-gpu-pci` as the display device (the dev-box stand-in for the 3040's
-  integrated GPU).
-- Hardware decode over VAAPI (`i965` driver) with `mpv --vo=gpu`.
-- A 720p H.264 / AAC file plays end-to-end (the media rule from SCOPE §5).
+```sh
+uv run task setup-sudoers   # once per clone (passwordless sudo for provision.sh)
+uv run task vm-build        # build the VM; leaves the disk at rest
+uv run task vm-run &        # boot in QEMU (4 vCPU, 2 GB, SSH on 2222)
+uv run task deploy-vm       # deploy repo, reboot, verify
+uv run task vm-shot         # screenshot to vm/screenshot.png
+```
 
-If this VM can't show a 720p file smoothly, the 3040 likely can't either —
-fix the video path here, cheaply, before touching a box.
+Under the hood:
+
+| Step | Script |
+|---|---|
+| `vm-build` | `vm/provision.sh` → `vm/install.py` (libvirt domain, unattended `setup-alpine`) |
+| `vm-run` | `vm/vmctl.py run` (raw QEMU, virtio-gpu, user-net, QMP) |
+| `deploy-vm` | `alpine/deploy.sh --vm --reboot` (tar over ssh → `setup.sh` → `verify.sh`) |
+| `vm-shot` | `vm/vmctl.py screenshot` (QMP `screendump`) |
 
 ---
 
 ## Prerequisites (host)
 
-- `qemu-system-x86_64` with **KVM** enabled (`/dev/kvm` accessible; you are in
-  the `kvm`/`libvirt` group).
-- An installed Rabbit Ears Alpine **disk image** (qcow2). Build one with the
-  normal install flow (`vm/provision.sh` + `vm/install.py`, or any Alpine
-  install) and point `--disk` at the resulting image.
-- Python 3.14 (stdlib only — `vmctl.py` needs no extra packages).
+- Debian/Ubuntu with `/dev/kvm` (you are in the `kvm`/`libvirt` group).
+- **uv** (the project pins Python 3.14, matching the VM/appliance; `vmctl.py` is stdlib-only).
+- `qemu-system-x86_64` and libvirt (installed by `provision.sh` on first run).
 
-Confirm KVM is usable before anything else:
+Confirm KVM is usable:
 
 ```sh
 egrep -c '(vmx|svm)' /proc/cpuinfo   # > 0
@@ -45,37 +47,23 @@ ls -l /dev/kvm                        # exists and you can read/write it
 
 ---
 
-## Creating the disk image
-
-`vmctl.py` boots whatever qcow2 you hand it. If you don't have one yet:
-
-```sh
-# 8 GB image, matching the prod box's disk size
-qemu-img create -f qcow2 rabbitears-vm.qcow2 8G
-```
-
-Then install Alpine into it (see `docs/alpine-install.md` for the full
-procedure, and `vm/provision.sh` for the automated libvirt-based install). The
-VM only needs a working Alpine with `mpv`, `ffmpeg`, and the i965 VAAPI driver
-installed (`apk add mpv ffmpeg mesa-vaapi-drivers` — confirm the driver with
-`vainfo` inside the VM).
-
----
-
 ## Running the VM
 
 ```sh
-python3 vm/vmctl.py run --disk /path/to/rabbitears-vm.qcow2
+uv run task vm-run
+# or directly:
+uv run vm/vmctl.py run
 ```
 
-This boots the VM and **streams the serial console to stdout**. The exact
-qemu invocation (fixed for reproducibility) is:
+This boots the VM and **streams the serial console to stdout**. The disk
+defaults to `/var/lib/libvirt/images/rabbitears-vm.qcow2` (the libvirt image);
+no `--disk` argument needed. The exact QEMU invocation:
 
 ```
 qemu-system-x86_64 \
-  -m 2G -smp 2 \
+  -m 2G -smp 4 \
   -cpu max,kvm=on -enable-kvm \
-  -drive file=DISK,if=virtio,format=qcow2 \
+  -drive file=/var/lib/libvirt/images/rabbitears-vm.qcow2,if=virtio,format=qcow2 \
   -device virtio-gpu-pci \
   -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
   -device virtio-net-pci,netdev=net0 \
@@ -84,18 +72,16 @@ qemu-system-x86_64 \
   -qmp unix:/tmp/rabbitears-qmp.sock,server,nowait
 ```
 
-- **Ctrl+C** shuts the VM down cleanly: `SIGTERM` first, escalating to
-  `SIGKILL` if it doesn't exit within a few seconds, then the process exits 0.
-  You never have to hunt for a stray qemu.
-- The QMP socket at `/tmp/rabbitears-qmp.sock` is opened automatically (see
-  [Taking a screenshot](#taking-a-screenshot-development-loop)); disable it
-  with `--monitor ""`.
+- **Ctrl+C** shuts the VM down cleanly (SIGTERM → SIGKILL).
+- **Preflight:** refuses to start if the libvirt domain is running
+  (run `uv run task vm-stop` first) or if the disk isn't readable/writable
+  (check your `kvm` group membership).
 
 ### Ports
 
 | Host port | Purpose |
 |---|---|
-| `127.0.0.1:4321` | Serial console (TCP). `run` streams it; `serial` attaches to it. |
+| `127.0.0.1:4321` | Serial console (TCP). |
 | `127.0.0.1:2222` | SSH, host-forwarded to the VM's `:22`. |
 | `/tmp/rabbitears-qmp.sock` | QMP monitor (Unix socket) for headless `screendump`. |
 
@@ -103,102 +89,55 @@ qemu-system-x86_64 \
 
 ## Attaching to a running VM's serial console
 
-If the VM is already up (e.g. you started it in one terminal), attach from a
-second terminal:
-
 ```sh
-python3 vm/vmctl.py serial            # defaults to 127.0.0.1:4321
-python3 vm/vmctl.py serial --host 127.0.0.1 --port 4321
+uv run task vm-serial
+# or: uv run vm/vmctl.py serial
 ```
-
-It forwards serial bytes to stdout until the connection closes (the VM went
-down). Log in over the console as `root`.
 
 ---
 
-## Taking a screenshot (development loop)
-
-Every `vmctl.py run` automatically opens a QMP monitor socket at
-`/tmp/rabbitears-qmp.sock`. Once the VM has booted, grab the current
-framebuffer from a second terminal:
+## Taking a screenshot
 
 ```sh
-python3 vm/vmctl.py screenshot
-# -> saves vm/screenshot.png and prints: screenshot saved: vm/screenshot.png (1280x800)
+uv run task vm-shot
+# → saves vm/screenshot.png
 ```
-
-Override the defaults when needed:
-
-```sh
-python3 vm/vmctl.py screenshot --monitor /tmp/other.sock --out /tmp/frame.png
-```
-
-The grab is synchronous and reliable (QMP `screendump` via the QEMU monitor
-socket). It works with `--display none` (headless) and `--display spice`.
 
 ---
 
-## Live display with SPICE
-
-Boot with `--display spice` to open a SPICE server on port 5910 and watch the
-VM output live:
+## Stopping the VM
 
 ```sh
-python3 vm/vmctl.py run --disk /path/to/rabbitears-vm.qcow2 --display spice
-
-# From another terminal (or after connecting over SSH):
-spicy --host=127.0.0.1 --port=5910
-# or
-virt-viewer spice://127.0.0.1:5910
+uv run task vm-stop    # shuts the libvirt domain down (idempotent)
 ```
 
-The SPICE server is on localhost only and requires no password
-(`disable-ticketing=on`). Combine with `--monitor /tmp/qmp.sock` to get both
-a live view and the QMP screendump capability.
+Or Ctrl+C in the `vm-run` terminal to stop the QEMU process.
 
 ---
 
 ## Validation checklist (inside the VM)
 
-Once the VM is up (serial console or `ssh -p 2222 root@127.0.0.1`):
+Once the VM is up (`ssh -i vm/keys/rabbitears-vm -p 2222 root@127.0.0.1`):
 
-1. **VAAPI driver present:**
+1. **Service is running:**
    ```sh
-   vainfo | grep -i i965     # expect the i965 driver listed
+   rc-service rabbitears status    # → started
    ```
-2. **A 720p file plays with hardware decode:**
+2. **App log exists:**
    ```sh
-   mpv --vo=gpu --hwdec=vaapi /path/to/sample-720p.mp4
+   ls -l /var/log/rabbitears.log
    ```
-   Watch for `hwdec: ... vaapi` in mpv's startup log and a visibly playing
-   picture (attach a display, or confirm no decode errors + steady playback).
-3. **No fallback to software decode.** If mpv logs a hwdec failure and falls
-   back to `sw`, the video path is *not* validated — that's the thing we're
-   trying to catch.
-
-If all three pass, the virtio-gpu + VAAPI path is good to carry forward to the
-3040 (M1).
-
----
-
-## Cleanup
-
-Ctrl+C in the `run` terminal (or kill the qemu process). The disk image is a
-plain file — delete it when you're done:
-
-```sh
-rm rabbitears-vm.qcow2
-```
+3. **A 720p file plays (software decode):**
+   ```sh
+   mpv --vo=gpu /path/to/sample-720p.mp4
+   ```
+   Watch for a visibly playing picture. Note: this is **software decode** —
+   the VM has no VAAPI. Hardware decode is validated only on the 3040 (M1).
 
 ---
 
 ## Related docs
 
-- `docs/alpine-install.md` — the full box/VM install procedure (diskless prod
-  install + the libvirt install VM this one complements).
-- `docs/hardware.md` — 3040 notes: BIOS settings, adapters, the video chain
-  (why the display path is the risky part we're validating here).
-- `docs/remote.md` — remote button map and USB IDs (for the later M3 milestone
-  once the video path is proven).
+- `docs/alpine-install.md` — the full box/VM install procedure.
 - `SCOPE.md` §2 (hardware), §4.3 (playback), §5 (media rules) — the source of
   truth for what "works" means.

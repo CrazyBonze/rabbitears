@@ -20,6 +20,23 @@ description="Rabbit Ears kid-safe cable box (mpv + clock schedule + remote)"
 
 supervisor=supervise-daemon
 
+# Logging: /var/log is RAM-backed on the diskless box and discarded at reboot.
+# This is an explicit, intended exception to SCOPE §3's "never writes to /" rule
+# (logs only, non-persistent).
+output_log="/var/log/rabbitears.log"
+error_log="/var/log/rabbitears.log"
+
+# Export PYTHONPATH so the supervised process can import the app package
+# installed at /opt/rabbitears. PYTHONDONTWRITEBYTECODE prevents Python from
+# writing __pycache__ into /opt/rabbitears (which would break verify.sh's
+# unmanaged-file check and violate "the app never writes to /").
+supervise_daemon_args="--env PYTHONPATH=/opt --env PYTHONDONTWRITEBYTECODE=1"
+
+# Respawn forever (SCOPE Goal 2: zero-interaction recovery). The default
+# respawn_max gives up after repeated crashes, which would leave the box stuck.
+respawn_max=0
+respawn_delay=2
+
 # The command to supervise (respawned on exit). Placeholder: no app code yet,
 # so this runs a no-op loop (keeps the service up without a respawn storm).
 # Replace once src/rabbitears/__main__.py is deployed to /opt/rabbitears:
@@ -35,6 +52,8 @@ start_pre() {
 }
 
 depend() {
+	need localmount
+	after bootmisc
 	# 'use' (not 'need') so a failed network does not block the service
 	# (SCOPE Goal #2: zero-interaction recovery). The app plays local media
 	# and does not strictly require the network.

@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Rabbit Ears — virtio-gpu validation VM control (vmctl).
+"""Rabbit Ears — dev VM control (vmctl).
 
-Boots a throwaway QEMU VM whose whole job is to prove the video path works
-before we commit to it on the real Wyse 3040: **virtio-gpu** as the display
-device, an SSH host-forward on 2222, and a TCP serial console on 4321.
+Boots the Rabbit Ears dev VM in raw QEMU (4 vCPU, 2 GB, virtio-gpu) for
+developing and validating the stack before touching a real Wyse 3040.
+The disk defaults to the libvirt image at
+/var/lib/libvirt/images/rabbitears-vm.qcow2; no --disk argument needed.
 
 Subcommands:
 
-  vmctl.py run --disk DISK.qcow2 [--monitor SOCK] [--display {none,spice}]
+  vmctl.py run [--monitor SOCK] [--display {none,spice}]
       Boot the VM and stream its serial console to stdout. Ctrl+C shuts the
       VM down cleanly (SIGTERM, then SIGKILL) and exits 0. A QMP monitor
       socket is opened at /tmp/rabbitears-qmp.sock by default (override with
       --monitor, disable with --monitor "") so `vmctl.py screenshot` works
-      out of the box.
+      out of the box. Preflight checks that the libvirt domain is not
+      running and the disk is readable/writable.
 
   vmctl.py serial [--host H --port P]
       Attach to an already-running VM's serial console and forward bytes to
@@ -35,6 +37,7 @@ import argparse
 import contextlib
 import functools
 import json
+import os
 import shutil
 import signal
 import socket
@@ -53,13 +56,14 @@ _RECV_SIZE = 4096
 _SERIAL_TIMEOUT = 0.1  # seconds between serial polls
 DEFAULT_MONITOR_SOCK = "/tmp/rabbitears-qmp.sock"
 DEFAULT_SCREENSHOT_OUT = "vm/screenshot.png"
+DEFAULT_DISK = "/var/lib/libvirt/images/rabbitears-vm.qcow2"
 
 
 def qemu_args(
     disk: Path | str,
     *,
     mem: str = "2G",
-    smp: str = "2",
+    smp: str = "4",
     monitor_sock: Path | str | None = DEFAULT_MONITOR_SOCK,
     display: str = "none",
 ) -> list[str]:
@@ -317,8 +321,85 @@ def cmd_screenshot(args: argparse.Namespace) -> int:
     return 0
 
 
+def preflight(
+    disk: Path,
+    *,
+    run=subprocess.run,
+    access=os.access,
+) -> None:
+    """Preflight checks before spawning QEMU. Exits 1 with an actionable message on failure.
+
+    Checks:
+      1. The libvirt domain is not running (would lock the disk).
+      2. The disk file is readable and writable by the current user.
+
+    ``run`` and ``access`` are injectable for unit testing.
+    """
+    import os as _os
+
+    # Check 1: libvirt domain must not be running.
+    # Primary: virsh domstate. Fallback: pgrep (works without libvirt group).
+    domain_running = False
+    try:
+        r = run(
+            ["virsh", "-c", "qemu:///system", "domstate", "rabbitears-vm"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and "running" in r.stdout:
+            domain_running = True
+        elif r.returncode != 0:
+            # virsh failed (e.g. permission denied); fall back to pgrep.
+            try:
+                pg = run(
+                    ["pgrep", "-f", "guest=rabbitears-vm"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if pg.returncode == 0 and pg.stdout.strip():
+                    domain_running = True
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass  # pgrep also unavailable; can't check.
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        # virsh not found at all; try pgrep.
+        try:
+            pg = run(
+                ["pgrep", "-f", "guest=rabbitears-vm"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if pg.returncode == 0 and pg.stdout.strip():
+                domain_running = True
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass  # can't check either way.
+    if domain_running:
+        print(
+            "[vmctl] ERROR: libvirt domain 'rabbitears-vm' is running. "
+            "Run 'uv run task vm-stop' first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Check 2: disk must be readable and writable.
+    if not access(str(disk), _os.R_OK | _os.W_OK):
+        try:
+            import grp
+            import pwd
+
+            st = _os.stat(str(disk))
+            owner = pwd.getpwuid(st.st_uid).pw_name
+            group = grp.getgrgid(st.st_gid).gr_name
+        except (OSError, KeyError, ImportError):
+            owner = group = "?"
+        print(
+            f"[vmctl] ERROR: disk {disk} is not readable/writable by the current user "
+            f"(owner: {owner}, group: {group}). "
+            f"Ensure you are in the 'kvm' group (provision.sh adds you; re-login needed).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Boot the VM and stream its serial console; Ctrl+C exits cleanly."""
+    preflight(Path(args.disk))
     if args.display == "spice":
         print(
             "[vmctl] SPICE display on port 5910 — connect with: "
@@ -365,7 +446,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_p = sub.add_parser("run", help="Boot the VM and stream its serial console")
-    run_p.add_argument("--disk", required=True, help="Path to the qcow2 disk image")
+    run_p.add_argument("--disk", default=DEFAULT_DISK, help=f"Path to the qcow2 disk image (default: {DEFAULT_DISK})")
     run_p.add_argument("--host", default=SERIAL_HOST, help="Serial console host")
     run_p.add_argument("--port", type=int, default=SERIAL_PORT, help="Serial console port")
     run_p.add_argument(

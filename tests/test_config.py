@@ -19,6 +19,7 @@ class LoadConfigTest(unittest.TestCase):
             self.assertEqual(cfg.osd_font_size, 72)
             self.assertEqual(cfg.socket_path, Path("/run/rabbitears/mpv.sock"))
             self.assertEqual(cfg.mount_point, Path("/media/rabbitears"))
+            self.assertEqual(cfg.testpattern_path, Path("/usr/share/rabbitears/testpattern.png"))
 
     def test_corrupt_toml_returns_all_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -37,6 +38,7 @@ class LoadConfigTest(unittest.TestCase):
                 "osd_font_size = 48\n"
                 'socket_path = "/tmp/mpv.sock"\n'
                 'mount_point = "/media/usb"\n'
+                'testpattern_path = "/usr/share/rabbitears/testpattern.png"\n'
             )
             cfg = load_config(path)
             self.assertEqual(cfg.epoch, 1700000000.0)
@@ -46,6 +48,7 @@ class LoadConfigTest(unittest.TestCase):
             self.assertEqual(cfg.osd_font_size, 48)
             self.assertEqual(cfg.socket_path, Path("/tmp/mpv.sock"))
             self.assertEqual(cfg.mount_point, Path("/media/usb"))
+            self.assertEqual(cfg.testpattern_path, Path("/usr/share/rabbitears/testpattern.png"))
 
     def test_one_invalid_value_falls_back_for_that_key_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -90,6 +93,27 @@ class LoadConfigTest(unittest.TestCase):
             self.assertIsInstance(cfg.mount_point, Path)
             self.assertEqual(cfg.socket_path, sock)
             self.assertEqual(cfg.mount_point, mount)
+
+    def test_testpattern_path_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = load_config(Path(tmp) / "nope" / "config.toml")
+            self.assertEqual(cfg.testpattern_path, Path("/usr/share/rabbitears/testpattern.png"))
+
+    def test_testpattern_path_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp) / "pattern.png"
+            path = Path(tmp) / "config.toml"
+            path.write_text(f'testpattern_path = "{tp.as_posix()}"\n')
+            cfg = load_config(path)
+            self.assertIsInstance(cfg.testpattern_path, Path)
+            self.assertEqual(cfg.testpattern_path, tp)
+
+    def test_testpattern_path_invalid_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("testpattern_path = 42\n")  # invalid: int, not string
+            cfg = load_config(path)
+            self.assertEqual(cfg.testpattern_path, Path("/usr/share/rabbitears/testpattern.png"))
 
 
 if __name__ == "__main__":

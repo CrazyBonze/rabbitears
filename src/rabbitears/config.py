@@ -46,6 +46,8 @@ class Config:
     socket_path: Path = field(default_factory=lambda: Path("/run/rabbitears/mpv.sock"))
     # USB drive mount point (SCOPE §3, §6).
     mount_point: Path = field(default_factory=lambda: Path("/media/rabbitears"))
+    # NO SIGNAL test pattern image (SCOPE §4.7).
+    testpattern_path: Path = field(default_factory=lambda: Path("/usr/share/rabbitears/testpattern.png"))
 
 
 # A pristine instance used as the per-key fallback source, so the defaults
@@ -109,4 +111,5 @@ def load_config(path: Path = _DEFAULT_CONFIG_PATH) -> Config:
         osd_font_size=_as_int(data.get("osd_font_size"), _DEFAULTS.osd_font_size),
         socket_path=_as_path(data.get("socket_path"), _DEFAULTS.socket_path),
         mount_point=_as_path(data.get("mount_point"), _DEFAULTS.mount_point),
+        testpattern_path=_as_path(data.get("testpattern_path"), _DEFAULTS.testpattern_path),
     )

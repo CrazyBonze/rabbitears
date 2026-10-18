@@ -5,11 +5,12 @@
 # Runs on the desktop (EVO-X2). Idempotent: safe to re-run. Pins a specific
 # Alpine release + SHA256 so the VM is always built from the same inputs.
 #
-# Usage:
-#   sudo ./vm/provision.sh            # create (if needed) + boot the VM
-#   sudo ./vm/provision.sh status     # show VM / ISO / disk status
-#   sudo ./vm/provision.sh eject      # detach the ISO so the VM boots from disk
-#   sudo ./vm/provision.sh destroy    # delete the VM + its disk (keeps the ISO)
+# Usage (self-elevates under the NOPASSWD rule from vm/setup-sudoers.sh):
+#   ./vm/provision.sh            # create (if needed) + install the base OS
+#   ./vm/provision.sh status     # show VM / ISO / disk status
+#   ./vm/provision.sh stop       # shut the domain down (idempotent)
+#   ./vm/provision.sh eject      # detach the ISO so the VM boots from disk
+#   ./vm/provision.sh destroy    # delete the VM + its disk (keeps the ISO)
 #
 set -euo pipefail
 
@@ -276,7 +277,35 @@ if [ "$cmd" = "eject" ]; then
   exit 0
 fi
 
-[ "$cmd" = "create" ] || die "unknown command: $cmd (use: create | status | eject | destroy)"
+# ---------------------------------------------------------------------------
+# stop — shut the domain down (idempotent; no-op if already off)
+# ---------------------------------------------------------------------------
+if [ "$cmd" = "stop" ]; then
+  state="$(virsh domstate "$VM_NAME" 2>/dev/null || true)"
+  if [ -z "$state" ] || [ "$state" = "error" ] || printf '%s' "$state" | grep -qi "not found"; then
+    log "VM '${VM_NAME}' is not defined; nothing to stop."
+    exit 0
+  fi
+  if [ "$state" = "shut off" ]; then
+    log "VM '${VM_NAME}' is already shut off."
+    exit 0
+  fi
+  log "Shutting down VM '${VM_NAME}'..."
+  virsh shutdown "$VM_NAME" 2>/dev/null || true
+  for _ in $(seq 1 60); do
+    state="$(virsh domstate "$VM_NAME" 2>/dev/null || true)"
+    [ "$state" = "shut off" ] && break
+    sleep 1
+  done
+  if [ "$state" != "shut off" ]; then
+    log "Graceful shutdown timed out; forcing destroy."
+    virsh destroy "$VM_NAME" 2>/dev/null || true
+  fi
+  log "VM '${VM_NAME}' is shut off."
+  exit 0
+fi
+
+[ "$cmd" = "create" ] || die "unknown command: $cmd (use: create | status | console | console-cmd | diskboot | liveboot | proxy | stop | eject | destroy)"
 
 # ---------------------------------------------------------------------------
 # 1. Prerequisites
@@ -388,6 +417,14 @@ chmod 0660 "$DISK_PATH"
 # ---------------------------------------------------------------------------
 # 6. Define the domain (direct kernel boot + pty serial), idempotent
 # ---------------------------------------------------------------------------
+# Check if the domain is already installed BEFORE killing anything.
+# Re-running create on an installed VM must be a no-op, not a hard-kill.
+_xml="$(virsh dumpxml "$VM_NAME" 2>/dev/null || true)"
+if [ -n "$_xml" ] && ! printf '%s' "$_xml" | grep -q '<kernel>' && printf '%s' "$_xml" | grep -q "<boot dev='hd'"; then
+  log "VM '${VM_NAME}' is already installed (boots from disk). Use 'destroy' to rebuild."
+  exit 0
+fi
+
 # Kill any orphaned qemu process for this VM (from a crashed/aborted run).
 pkill -f "guest=${VM_NAME}" 2>/dev/null || true
 if ! virsh list --all --name 2>/dev/null | grep -qx "$VM_NAME"; then
@@ -424,10 +461,6 @@ if ! virsh list --all --name 2>/dev/null | grep -qx "$VM_NAME"; then
       <readonly/>
     </disk>
     <serial type='pty'><target port='0'/></serial>
-    <channel type='unix'>
-      <source mode='bind' path='/tmp/rabbitears-qmp.sock'/>
-      <target type='virtio' name='org.qemu.guest_agent.0'/>
-    </channel>
     <input type='tablet' bus='usb'/>
     <graphics type='spice' autoport='yes' listen='127.0.0.1'>
       <listen type='address' address='127.0.0.1'/>
@@ -457,7 +490,23 @@ log "Running the zero-touch install (serial console + paramiko)..."
 RB_VM_NAME="$VM_NAME" RB_SERIAL_PORT="$SERIAL_PORT" python3 "${REPO_ROOT}/vm/install.py"
 
 # ---------------------------------------------------------------------------
-# 8. Next steps
+# 8. Leave the disk at rest: shut the domain down so vmctl.py can open it.
+# ---------------------------------------------------------------------------
+log "Shutting down the domain (disk left at rest for vmctl.py)..."
+virsh shutdown "$VM_NAME" 2>/dev/null || true
+for _ in $(seq 1 60); do
+  state="$(virsh domstate "$VM_NAME" 2>/dev/null || true)"
+  [ "$state" = "shut off" ] && break
+  sleep 1
+done
+if [ "$state" != "shut off" ]; then
+  log "Graceful shutdown timed out; forcing destroy."
+  virsh destroy "$VM_NAME" 2>/dev/null || true
+fi
+log "Domain '${VM_NAME}' is shut off (still defined for console/liveboot)."
+
+# ---------------------------------------------------------------------------
+# 9. Next steps
 # ---------------------------------------------------------------------------
 cat <<EOF
 
@@ -467,9 +516,10 @@ cat <<EOF
    ISO  ${ALPINE_ISO} (SHA256 verified)
 
  The base install + SSH verification ran automatically (see above).
+ The domain is shut off; the disk is ready for vmctl.py.
  Next:
-   1. Find the IP:   sg libvirt -c 'virsh domifaddr ${VM_NAME}'
-   2. SSH in:        ssh -i vm/keys/rabbitears-vm root@<vm-ip>
-   3. Watch it:   virt-viewer --connect qemu:///system ${VM_NAME}
+   1. Boot the VM:   uv run task vm-run
+   2. Deploy:        uv run task deploy-vm
+   3. Screenshot:    uv run task vm-shot
 ============================================================
 EOF

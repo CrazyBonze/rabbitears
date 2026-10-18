@@ -13,11 +13,17 @@ Once the base OS is up, both get the identical Rabbit Ears stack from
 
 ## 1. VM — zero-touch install (dev)
 
-One command provisions the KVM VM, drives an unattended `setup-alpine` over the
-serial console, switches the VM to boot from disk, and verifies SSH:
+**One-time per clone:** install passwordless sudo for the VM scripts:
 
 ```sh
-sudo ./vm/provision.sh
+./vm/setup-sudoers.sh    # asks for your sudo password once
+```
+
+One command provisions the KVM VM, drives an unattended `setup-alpine` over the
+serial console, and leaves the disk at rest (domain shut off):
+
+```sh
+./vm/provision.sh        # self-elevates under the NOPASSWD rule
 ```
 
 What it does (idempotent, safe to re-run):
@@ -46,15 +52,16 @@ What it does (idempotent, safe to re-run):
 ### Subcommands
 
 ```sh
-sudo ./vm/provision.sh                    # create + zero-touch install (default)
-sudo ./vm/provision.sh status             # VM + ISO + disk status
-sudo ./vm/provision.sh proxy              # start the local apk caching proxy
-sudo ./vm/provision.sh console            # dump the serial console (debugging)
-sudo ./vm/provision.sh console-cmd "<c>"  # run a command on the console, read result
-sudo ./vm/provision.sh diskboot           # boot the installed system (from disk)
-sudo ./vm/provision.sh liveboot           # boot the live ISO (to inspect the disk)
-sudo ./vm/provision.sh eject              # detach the ISO (boot from disk)
-sudo ./vm/provision.sh destroy            # destroy the VM + its disk
+./vm/provision.sh                    # create + zero-touch install (default)
+./vm/provision.sh status             # VM + ISO + disk status
+./vm/provision.sh proxy              # start the local apk caching proxy
+./vm/provision.sh stop               # shut the domain down (idempotent)
+./vm/provision.sh console            # dump the serial console (debugging)
+./vm/provision.sh console-cmd "<c>"  # run a command on the console, read result
+./vm/provision.sh diskboot           # boot the installed system (from disk)
+./vm/provision.sh liveboot           # boot the live ISO (to inspect the disk)
+./vm/provision.sh eject              # detach the ISO (boot from disk)
+./vm/provision.sh destroy            # destroy the VM + its disk
 ```
 
 ### SSH in
@@ -67,7 +74,8 @@ ssh -i vm/keys/rabbitears-vm root@<vm-ip>        # key auth, no password
 ### Rebuild from scratch
 
 ```sh
-sudo ./vm/provision.sh destroy && sudo ./vm/provision.sh
+./vm/provision.sh destroy && ./vm/provision.sh
+# or: uv run task vm-rebuild
 ```
 
 ---
@@ -135,10 +143,11 @@ if the drive is absent, state is kept in memory only.
 - [ ] `apk system update` is clean
 - [ ] `rc-service sshd status` → running (dev access)
 - [ ] `chrony` synced (correct time — the schedule depends on it)
-- [ ] `./alpine/setup.sh` ran clean (packages, `system/` config, `rc-update`, `lbu include`)
+- [ ] `alpine/deploy.sh … --reboot` ran clean (packages, `system/` config, app code, `rc-update`, `lbu include`, manifest)
 - [ ] **Reboot** (not just `rc-service start`) — the service must come up through the real OpenRC boot sequence
 - [ ] `rc-service rabbitears status` → `started`
 - [ ] `/run/rabbitears/` exists (created by the init script's `start_pre()`)
+- [ ] `/var/log/rabbitears.log` exists
 - [ ] `supervise-daemon` is running with the supervised process (check respawn: kill the child, it comes back)
 
 ### The `rabbitears` service must boot (M1 gate)
@@ -149,13 +158,13 @@ boot under `supervise-daemon` (respawn on crash, SCOPE §4.7). Verify it with a
 the boot path:
 
 ```sh
-# 1. install the stack
-./alpine/setup.sh
-# 2. reboot (the real test)
-reboot
-# 3. after it's back up:
+# 1. deploy the stack (tar over ssh → setup.sh → verify.sh)
+uv run task deploy-vm             # VM
+# or: alpine/deploy.sh --host H --commit --reboot   # box
+# 2. after it's back up:
 rc-service rabbitears status      # → * status: started
 ls -ld /run/rabbitears            # → exists (start_pre ran)
+ls -l /var/log/rabbitears.log     # → exists
 pgrep -af supervise-daemon        # → the supervisor + supervised process
 ```
 

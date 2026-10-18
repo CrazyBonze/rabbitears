@@ -38,6 +38,13 @@ vm-build = { cmd = "./vm/provision.sh", help = "Build the VM from the pinned Alp
 pre_vm-rebuild = "task vm-proxy"
 vm-rebuild = { cmd = "./vm/provision.sh destroy && ./vm/provision.sh", help = "Destroy and rebuild the VM from scratch (the reproducibility check)" }
 vm-status = { cmd = "./vm/provision.sh status", help = "Show VM, ISO and disk status" }
-vm-run = { cmd = "python vm/vmctl.py run --disk /var/lib/libvirt/images/rabbitears-vm.qcow2", help = "Boot the VM in QEMU and stream its serial console" }
+vm-run = { cmd = "python vm/vmctl.py run", help = "Boot the VM in QEMU and stream its serial console" }
 vm-serial = { cmd = "python vm/vmctl.py serial", help = "Attach to the running VM's serial console" }
 vm-shot = { cmd = "python vm/vmctl.py screenshot", help = "Screenshot the running VM to vm/screenshot.png" }
+vm-stop = { cmd = "./vm/provision.sh stop", help = "Shut the VM domain down (idempotent)" }
+deploy-vm = { cmd = "alpine/deploy.sh --vm --reboot", help = "Deploy the repo to the VM, reboot, and verify" }
+vm-verify = { cmd = "alpine/verify.sh --vm", help = "Read-only drift check against the VM" }
+deploy-box = { cmd = "alpine/deploy.sh --commit --reboot", help = "Deploy to a box (append --host H); commits + reboots" }
+box-verify = { cmd = "alpine/verify.sh", help = "Read-only drift check against a box (append --host H)" }
+transcode = { cmd = "tools/transcode.sh", help = "Transcode media to SCOPE §5 compliance (append SRC_DIR DEST_DIR)" }
+media-check = { cmd = "tools/transcode.sh --check", help = "Check media files for SCOPE §5 compliance (append DIR)" }

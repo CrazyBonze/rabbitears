@@ -167,6 +167,45 @@ class GetDurationsTest(unittest.TestCase):
             index_path = Path(tmp) / "index.json"
             self.assertEqual(get_durations(Path(tmp) / "nope", index_path), [])
 
+    def test_logs_non_mp4_files_at_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            channel = self._make_channel(tmp, ["a.mp4", "b.webm", "c.mkv"])
+            index_path = Path(tmp) / ".rabbitears" / "index.json"
+            with mock.patch.object(index_mod, "probe_duration", return_value=10.0), \
+                    self.assertLogs("rabbitears.index", level="WARNING") as logs:
+                durations = get_durations(channel, index_path)
+            # Only the mp4 file is in the result.
+            self.assertEqual([p.name for p, _ in durations], ["a.mp4"])
+            # Non-mp4 files are logged.
+            self.assertTrue(any("b.webm" in m and "not .mp4" in m for m in logs.output))
+            self.assertTrue(any("c.mkv" in m and "not .mp4" in m for m in logs.output))
+
+    def test_logs_unprobeable_mp4_at_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            channel = self._make_channel(tmp, ["broken.mp4"])
+            index_path = Path(tmp) / ".rabbitears" / "index.json"
+            with mock.patch.object(index_mod, "probe_duration", return_value=None), \
+                    self.assertLogs("rabbitears.index", level="WARNING") as logs:
+                durations = get_durations(channel, index_path)
+            self.assertEqual(durations, [])
+            self.assertTrue(any("broken.mp4" in m and "ffprobe failed" in m for m in logs.output))
+
+    def test_ignores_channel_toml_and_dotfiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Include a .webm so a warning IS emitted; verify channel.toml
+            # and dotfiles are NOT among the warnings.
+            channel = self._make_channel(tmp, ["a.mp4", "b.webm", "channel.toml", ".hidden"])
+            index_path = Path(tmp) / ".rabbitears" / "index.json"
+            with mock.patch.object(index_mod, "probe_duration", return_value=10.0), \
+                    self.assertLogs("rabbitears.index", level="WARNING") as logs:
+                durations = get_durations(channel, index_path)
+            # Only the mp4 file is in the result.
+            self.assertEqual([p.name for p, _ in durations], ["a.mp4"])
+            # b.webm IS logged, but channel.toml and dotfiles are NOT.
+            self.assertTrue(any("b.webm" in m for m in logs.output))
+            self.assertFalse(any("channel.toml" in m for m in logs.output))
+            self.assertFalse(any(".hidden" in m for m in logs.output))
+
 
 if __name__ == "__main__":
     unittest.main()
