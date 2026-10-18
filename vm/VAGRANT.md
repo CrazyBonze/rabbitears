@@ -34,7 +34,7 @@ fix the video path here, cheaply, before touching a box.
 - An installed Rabbit Ears Alpine **disk image** (qcow2). Build one with the
   normal install flow (`vm/provision.sh` + `vm/install.py`, or any Alpine
   install) and point `--disk` at the resulting image.
-- Python 3.13 (stdlib only — `vmctl.py` needs no extra packages).
+- Python 3.14 (stdlib only — `vmctl.py` needs no extra packages).
 
 Confirm KVM is usable before anything else:
 

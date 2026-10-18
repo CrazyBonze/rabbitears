@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "Michael Taylor", email = "90michaeltaylor@gmail.com" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = []
 
 [project.scripts]
@@ -15,3 +15,29 @@ rabbitears = "rabbitears:main"
 [build-system]
 requires = ["uv_build>=0.12.20,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "taskipy>=1.14.1",
+]
+
+# Common tasks: `uv run task --list`, `uv run task <name> [extra args]`.
+# Rule: every task that changes a target (VM/box) goes through the repo's
+# idempotent scripts (provision.sh, deploy.sh, setup.sh). There is deliberately
+# no task for running ad-hoc commands on a target.
+[tool.taskipy.settings]
+cwd = "."   # run from the repo root regardless of where `task` is invoked
+
+[tool.taskipy.tasks]
+test = { cmd = "python -m unittest discover tests/ -v", help = "Run the full unit test suite" }
+unit = { cmd = "python -m unittest", help = "Run specific tests, e.g. task unit tests.test_schedule" }
+setup-sudoers = { cmd = "./vm/setup-sudoers.sh", help = "One-time per clone: passwordless sudo for the VM root scripts" }
+vm-proxy = { cmd = "./vm/provision.sh proxy", help = "Start the apk caching proxy (idempotent)" }
+pre_vm-build = "task vm-proxy"
+vm-build = { cmd = "./vm/provision.sh", help = "Build the VM from the pinned Alpine ISO (idempotent)" }
+pre_vm-rebuild = "task vm-proxy"
+vm-rebuild = { cmd = "./vm/provision.sh destroy && ./vm/provision.sh", help = "Destroy and rebuild the VM from scratch (the reproducibility check)" }
+vm-status = { cmd = "./vm/provision.sh status", help = "Show VM, ISO and disk status" }
+vm-run = { cmd = "python vm/vmctl.py run --disk /var/lib/libvirt/images/rabbitears-vm.qcow2", help = "Boot the VM in QEMU and stream its serial console" }
+vm-serial = { cmd = "python vm/vmctl.py serial", help = "Attach to the running VM's serial console" }
+vm-shot = { cmd = "python vm/vmctl.py screenshot", help = "Screenshot the running VM to vm/screenshot.png" }
