@@ -49,6 +49,7 @@ Kid-safe "cable box" for a Dell Wyse 3040: Alpine (diskless + lbu), OpenRC, one 
 
 - Host must be Debian/Ubuntu (`provision.sh` installs qemu/libvirt with `apt`) with `/dev/kvm`.
 - **One-time per clone:** `uv run task setup-sudoers` (asks for the password once). It installs NOPASSWD rules in `/etc/sudoers.d/rabbitears` for this checkout's `vm/provision.sh` and `vm/make-usb.sh`, the only scripts that need root. Re-run it after moving the repo. If a root script prompts for a password, this hasn't been run: ask the user to run it.
+- **Group membership:** `vm-build` (`provision.sh`) adds you to the `kvm` and `libvirt` groups so `vm-run`/`vm-stop` work without sudo. That only takes effect in **new** terminals — an already-open shell fails `vm-run`'s disk preflight until you log out/in (stopgap: `sg kvm -c "uv run task vm-run"`). Don't `usermod` yourself: it's already done by `vm-build`.
 - **The loop:** `uv run task vm-build` (build; leaves the disk at rest) → `uv run task vm-run` (boot in QEMU) → `uv run task deploy-vm` (deploy + reboot + verify) → `uv run task vm-shot` (screenshot).
 - `uv run task vm-build` builds the KVM VM via libvirt and an unattended `setup-alpine` (`vm/provision.sh` → `vm/install.py`). It leaves the domain shut off so `vmctl.py` can open the disk.
   - Its `pre_` hook starts the apk caching proxy (`vm-proxy`). The answerfile points apk at `192.168.122.1:8081`; the public CDN over the VM's NAT is very slow.

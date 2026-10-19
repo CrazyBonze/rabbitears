@@ -1,137 +1,119 @@
-# Agent prompt: VM screenshot validation loop + NO SIGNAL test pattern
+# Agent prompt: screenshot + NO SIGNAL follow-ups (honest failures, real tests)
 
-**Two goals:**
-1. Make the VM screenshot capability a clean, first-class part of the development loop — one command, sane defaults, useful output.
-2. Generate the `tools/testpattern.png` NO SIGNAL image that the app will display when there is nothing to play (SCOPE §4.7, §6).
+**Status:** the original version of this prompt was completed in commit `5369434`. That version covered the QMP socket on by default, the VNC removal, the zero-argument `vmctl.py screenshot`, the `tools/testpattern.png` generator and asset, and the consolidated VAGRANT.md section. The original text is at `git show ced2442:docs/prompts/validate-and-nosignal.md`. **Don't redo any of it.** Later commits changed the conventions that version assumed: `--disk` now defaults to the libvirt image, everything runs through `uv run task …`, and VAGRANT.md is organised around tasks. This prompt covers only the gaps found in review.
 
-Repository is at `/home/michael/rabbitears`. Read `vm/vmctl.py`, `SCOPE.md`, and `vm/VAGRANT.md` in full before making any changes.
+**Goal: a screenshot either produces a real PNG or fails loudly, and the tests check what the image actually contains, not its file size.**
 
----
+This task adds **no app features** and **doesn't change how the test card looks**. Bars, font, layout and scan lines all stay exactly as they are.
 
-## Context
-
-`vmctl.py` now has two screenshot paths: a VNC-based background thread (`--screenshot`) and a QMP `screendump` subcommand (`vmctl.py screenshot --monitor SOCK --out FILE`). In practice the QMP path is the right one for the development loop — it is synchronous, reliable, and works headless. The VNC path is fragile (depends on a VNC port being open, races against the VM coming up, runs in a daemon thread that can be silently killed). The goal is to make `vmctl.py run` with a `--monitor` socket the standard way to boot and grab a frame, and to make the grab itself a single obvious command.
+Work from the repository root (paths are repo-relative). Read these in full before making changes: `AGENTS.md`, `vm/vmctl.py`, `tools/generate_testpattern.py`, `tests/test_vmctl.py`, `vm/VAGRANT.md`, and `pyproject.toml` (the `[tool.taskipy]` sections).
 
 ---
 
-## Part 1: Clean up `vmctl.py run` defaults and remove the VNC screenshot path
+## Problems being fixed
 
-The VNC screenshot machinery (`--screenshot`, `--screenshot-out`, `--screenshot-delay`, `--vnc-host`, `--vnc-port`, `_screenshot_worker`, `start_screenshot_thread`, `_grab_vnc_frame_pyvnc`, `_grab_vnc_frame_raw`, `_grab_vnc_frame`, `_save_png`, and the `VNC_HOST`/`VNC_PORT`/`DEFAULT_SCREENSHOT_OUT`/`DEFAULT_SCREENSHOT_DELAY` constants) should be **removed**. It was a reasonable first attempt but the QMP path supersedes it entirely and the VNC path has no VNC endpoint in the current VM setup (provision.sh now uses SPICE). Removing it simplifies the interface and eliminates dead code.
-
-The `struct` and `zlib` imports were used only by the VNC path and `_save_png`; remove them too if nothing else uses them.
-
-After removal the `run` subcommand should have exactly these arguments:
-- `--disk` (required)
-- `--host` / `--port` (serial console, existing defaults)
-- `--monitor` (optional, QMP socket path — same as today)
-- `--display {none,spice}` (existing, default `none`)
-
-### Default monitor socket path
-
-When `--monitor` is not supplied, default it to `/tmp/rabbitears-qmp.sock` rather than `None`. This means every `vmctl.py run` automatically exposes a QMP socket without the user having to ask, making `vmctl.py screenshot` work out of the box immediately after boot. The user can override or disable it with `--monitor ""` (treat an empty string as "no socket").
+1. **A screenshot can fail silently.** `ppm_to_png` tries Pillow, then ImageMagick `convert`. If both are missing it copies the raw PPM to `screenshot.png`, prints `screenshot saved: …` and exits 0. Pillow isn't in the uv env, so on a clone without ImageMagick every screenshot is a PPM with a `.png` name and nothing reports a problem.
+2. **The `vmctl.py` docstring is wrong.** It says "Stdlib only", but the conversion step depends on Pillow or `convert`. `vm/VAGRANT.md` (Prerequisites) makes the same claim ("`vmctl.py` is stdlib-only"). Part 1 makes that claim true, so VAGRANT.md needs no edit there.
+3. **The screenshot path has no tests.** Nothing covers `ppm_to_png`, `_ppm_dimensions` or `cmd_screenshot`.
+4. **The test-pattern test is weak.** It only checks `len(data) > 10 KB`. The asset is 10,712 bytes, so a design change that compresses better (removing the scan lines, say) would fail the test even though the PNG is valid. Meanwhile a wrong image of the right size passes. Nothing checks that the committed `tools/testpattern.png` still matches the generator.
+5. **`TestPatternTest` imports the generator through `sys.path`.** AGENTS.md says `vm/` and `tools/` scripts are loaded by file path, as `test_vmctl.py` already does for `vmctl.py`.
 
 ---
 
-## Part 2: Make `vmctl.py screenshot` pleasant to use
+## Part 1: stdlib PPM→PNG in `vm/vmctl.py`
 
-The `screenshot` subcommand already exists but requires both `--monitor` and `--out`. Improve it:
+Replace the Pillow/`convert`/copy fallback chain with a stdlib-only converter (`zlib`, `struct`):
 
-- Default `--monitor` to `/tmp/rabbitears-qmp.sock` (matching the new `run` default).
-- Default `--out` to `vm/screenshot.png`.
-- After a successful grab, print a single clear line to stdout:
-  ```
-  screenshot saved: vm/screenshot.png  (1280x800)
-  ```
-  Include the actual pixel dimensions read from the PPM header.
-- On failure, print a clear warning to stderr and exit 1 (not 0 — so a script can detect the failure).
-
-Reading the PPM header for dimensions: a PPM written by QEMU starts with `P6\n<width> <height>\n<maxval>\n`. Parse width and height from that header to include in the success message.
-
----
-
-## Part 3: Generate `tools/testpattern.png`
-
-Create `tools/generate_testpattern.py` — a standalone script that generates and writes `tools/testpattern.png`. Run it as part of this task to produce the file.
-
-The image must:
-- Be **1280×720** (720p — the max resolution per SCOPE §5, and a safe target for both the VM and the Wyse 3040 via composite)
-- Use **only stdlib** (`zlib`, `struct`) — no Pillow, no numpy, no external tools. The same `_save_png` pattern already in vmctl.py is fine to adapt.
-- Look like a real analog TV "no signal" card: **not** a modern flat "no input" screen. The design should feel like a 1980s/90s broadcast test card — something a kid would recognize as "the TV isn't working." Specific requirements:
-  - **Black background**
-  - **"NO SIGNAL"** in large white text, centered. Render the text as a pixel bitmap using a hardcoded 8×8 or 5×7 bitmap font embedded directly in the script (a small ASCII subset is enough — you only need A–Z, 0–9, space, and a handful of punctuation). No font files, no PIL.
-  - **Colored vertical bars** across the top third of the image — the classic SMPTE-style bar pattern (white, yellow, cyan, green, magenta, red, blue, black, left to right). These are immediately recognizable as a broadcast test card.
-  - **Scan-line effect**: every other horizontal line should be 85% brightness (multiply RGB by 0.85) to simulate a CRT scan-line texture across the whole image.
-  - The overall mood: lo-fi, analog, broadcast. Not slick.
-
-The script should be runnable directly:
-```sh
-python3 tools/generate_testpattern.py
-# -> writes tools/testpattern.png and prints: generated tools/testpattern.png (1280x720)
-```
-
-It must be idempotent (safe to re-run, overwrites silently).
+- **`_read_ppm(path) -> tuple[int, int, bytes]`** returns width, height and the RGB bytes.
+  - Parse the P6 header as whitespace-separated tokens: magic, width, height, maxval. Skip `#` comment lines. Don't rely on `\n` positions.
+  - Require magic `P6` and maxval `255`.
+  - Require exactly `width * height * 3` bytes of pixel data after the single whitespace byte that ends the header.
+  - Raise `ValueError` with a clear message on any violation.
+- **`_encode_png(width, height, rgb) -> bytes`** produces 8-bit RGB (colour type 2) with filter type 0 on every scanline and `IHDR`/`IDAT`/`IEND` chunks with correct CRCs.
+  - The same pattern already exists as `_save_png` in `tools/generate_testpattern.py`. **Duplicate it** rather than importing across scripts: both are standalone files loaded by path, and the code is about 15 lines.
+- **`ppm_to_png(ppm_path, png_path) -> tuple[int, int]`** reads, encodes, and writes `png_path` atomically (temp file in the same directory, then `os.replace`). It returns `(width, height)` and **raises** on failure. If it fails, an existing `png_path` must be left untouched.
+- **Remove `_ppm_dimensions`.** `ppm_to_png` returns the dimensions now.
+- **`cmd_screenshot`** uses the returned dimensions.
+  - Success prints exactly `screenshot saved: <out>  (<W>x<H>)` to stdout, exit 0. That's the current format, two spaces before the parenthesis.
+  - Any exception prints `[vmctl] WARNING: …` to stderr, exit 1. Keep the temp-dir cleanup.
+- **Fix the module docstring:** stdlib only, no Pillow or ImageMagick. When you're done, `vm/vmctl.py` must contain no `PIL` import and no `convert` call.
 
 ---
 
-## Part 4: Update `VAGRANT.md`
+## Part 2: tests in `tests/test_vmctl.py`
 
-Replace the "Screenshot (visual confirmation)" section and the "Taking a screenshot via QMP (headless)" section with a single consolidated section:
+Add a module-level helper, `_decode_png(data: bytes) -> tuple[int, int, int, int, bytes]`, returning width, height, bit depth, colour type and raw RGB. It must:
+- check the PNG signature
+- walk the chunks and verify each CRC
+- concatenate and decompress `IDAT`
+- support filter type 0 only (fail the test on anything else)
+- strip the per-row filter byte
 
-```markdown
-## Taking a screenshot (development loop)
+Both new test classes use it.
 
-Every `vmctl.py run` automatically opens a QMP monitor socket at
-`/tmp/rabbitears-qmp.sock`. Once the VM has booted, grab the current
-framebuffer from a second terminal:
+**`PpmToPngTest`**
+- **Round trip.** Write a small P6 PPM (e.g. 3×2, every pixel distinct, with a `# comment` line in the header). Then `ppm_to_png` it and decode the result. Expect the returned dimensions, the IHDR dimensions, bit depth 8, colour type 2, and pixels identical to the input.
+- **Bad input** (one subtest each): `P3` magic, maxval `65535`, truncated pixel data, an empty file.
+  - Each raises `ValueError`.
+  - A pre-existing output file keeps its original bytes.
+  - No temp file is left in the output directory.
 
-```sh
-python3 vm/vmctl.py screenshot
-# -> saves vm/screenshot.png and prints: screenshot saved: vm/screenshot.png (1280x800)
-```
+**`CmdScreenshotTest`** (mock `vmctl.screendump`; no real sockets)
+- **Success.** The mocked `screendump` writes a small valid PPM to the path it was given. Expect exit 0, the exact stdout line above, and a decodable PNG at `--out`.
+- **QMP failure.** `screendump` raises `ConnectionError`. Expect exit 1, a `[vmctl] WARNING` on stderr, and a pre-existing `--out` file left byte-for-byte unchanged.
+- **Bad PPM.** `screendump` writes garbage. Expect exit 1 and the out file unchanged.
 
-Override the defaults when needed:
+**`TestPatternTest`** (rewrite it)
+- Load `tools/generate_testpattern.py` with `importlib.util.spec_from_file_location`, following the `vmctl` pattern at the top of the file. Drop the `sys.path` manipulation.
+- Generate into a temp dir and decode. Assert 1280×720, bit depth 8, colour type 2. **Remove the `> 10 KB` assertion.**
+- Check pixels against the spec, not against the generator's constants. Hardcode the expected values in the test.
+  - **Bars.** Bars are 160 px wide and occupy rows 0–239. At the horizontal centre of each of the 8 bars, check one even row and one odd row:
+    - even row: white `(255,255,255)`, yellow `(255,255,0)`, cyan `(0,255,255)`, green `(0,255,0)`, magenta `(255,0,255)`, red `(255,0,0)`, blue `(0,0,255)`, black `(0,0,0)`
+    - odd row: each channel is `int(c * 0.85)`
+  - **Background.** A pixel well below the bars and outside the text, e.g. (40, 650), is black.
+  - **Text.** The text band (rows 440–519, columns 280–999) contains at least one pixel with every channel at 255 on an even row. There are no non-black pixels in rows 240–439 or 520–719.
+- **The committed asset matches the generator.** Decode `tools/testpattern.png` from the repo and compare its pixels (not its bytes) to the freshly generated image. Compare pixels because zlib builds can produce different compressed bytes for identical images.
+
+Keep every other existing test as it is.
+
+---
+
+## Part 3: `vm/VAGRANT.md`
+
+Extend the "Taking a screenshot" section. Keep it short and use tasks only, no bare `python3`:
+
+````markdown
+## Taking a screenshot
 
 ```sh
-python3 vm/vmctl.py screenshot --monitor /tmp/other.sock --out /tmp/frame.png
+uv run task vm-shot
+# → screenshot saved: vm/screenshot.png  (1280x800)
+uv run task vm-shot --out /tmp/frame.png   # extra args go to vmctl.py screenshot
 ```
 
-The grab is synchronous and reliable (QMP `screendump` via the QEMU monitor
-socket). It works with `--display none` (headless) and `--display spice`.
-```
+Uses QMP `screendump` on `/tmp/rabbitears-qmp.sock`, which every `vm-run` opens.
+It works headless and needs only the stdlib. It exits non-zero and leaves any
+existing file untouched if the VM isn't running or the grab fails.
+````
 
-Keep the "Live display with SPICE" section unchanged.
-
----
-
-## Part 5: Update `tests/test_vmctl.py`
-
-- Remove all tests that cover the deleted VNC screenshot machinery
-  (`ScreenshotTest` and any helpers that only supported it).
-- Update `QmpScreendumpTest`:
-  - `test_qemu_args_monitor_default` — verify that calling `qemu_args()` with no `monitor_sock` argument still produces a `-qmp` flag pointing at `/tmp/rabbitears-qmp.sock`.
-  - `test_qemu_args_monitor_override` — verify a custom `monitor_sock=Path("/tmp/other.sock")` is used instead.
-  - `test_qemu_args_monitor_disabled` — verify that passing `monitor_sock=None` explicitly omits `-qmp` entirely. (This is the escape hatch for `--monitor ""`.)
-  - Existing tests for `display=none`, `display=spice`, QMP handshake sequence, and protocol error should be kept and still pass.
-- Add `test_generate_testpattern` in a new `TestPatternTest` class:
-  - Import `generate_testpattern` from `tools/generate_testpattern.py` (add `tools/` to `sys.path` in the test setUp, or import it directly).
-  - Call the generation function with a temp output path.
-  - Assert the file exists, starts with `b"\x89PNG"`, and is larger than 10 KB (a sanity check that it isn't empty).
+`vm/screenshot.png` is tracked. Don't commit incidental changes to it.
 
 ---
 
 ## Completion criteria
 
-1. `python3 -m unittest discover tests/ -v` — all vmctl tests pass; no ScreenshotTest (VNC) tests remain.
-2. `python3 vm/vmctl.py run --disk /path/to/disk.qcow2` automatically exposes `/tmp/rabbitears-qmp.sock`.
-3. `python3 vm/vmctl.py screenshot` (no arguments) grabs from `/tmp/rabbitears-qmp.sock` and saves `vm/screenshot.png`.
-4. `python3 tools/generate_testpattern.py` produces `tools/testpattern.png` — a valid PNG, 1280×720, with colored bars and scan-line texture.
-5. `tools/testpattern.png` is committed to the repo (it is a static asset, not generated at runtime).
+1. `uv run task test`: all tests pass, with only the 4 expected `test_player.IntegrationStubs` skips.
+2. `vm/vmctl.py` contains no `PIL` and no `convert` (check with the Grep tool).
+3. **With the VM stopped:** `uv run task vm-shot` exits non-zero and prints a `[vmctl] WARNING` to stderr. `git status` shows `vm/screenshot.png` unchanged.
+4. **With the VM running** (`uv run task vm-run` in another terminal; ask the user if it can't start, e.g. because the libvirt domain is up): `uv run task vm-shot` prints the success line, and `file vm/screenshot.png` reports `PNG image data, … 8-bit/color RGB`. Look at the image and describe it. Then restore the tracked file: `git checkout vm/screenshot.png`.
+5. `uv run python tools/generate_testpattern.py` still prints `generated tools/testpattern.png (1280x720)`. If the bytes of `tools/testpattern.png` change but the pixel-equality test passes, it's just a different zlib: restore the file with `git checkout` and don't commit it.
+6. No commits unless the user asks.
 
 ---
 
 ## Report back with
 
-- Summary of every file changed or created and what changed.
-- Full `python3 -m unittest discover tests/ -v` output.
-- Confirmation that `tools/testpattern.png` was written and its file size.
-- Any decisions made about the test pattern design (font choice, bar colors, etc.).
+- Every file changed and what changed in it.
+- Full `uv run task test` output.
+- Output of criteria 3 and 4, including what the live screenshot shows (or why the live check couldn't run).
+- Anything in the spec you found wrong or ambiguous and how you resolved it.

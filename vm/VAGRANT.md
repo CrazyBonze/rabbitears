@@ -34,7 +34,7 @@ Under the hood:
 
 ## Prerequisites (host)
 
-- Debian/Ubuntu with `/dev/kvm` (you are in the `kvm`/`libvirt` group).
+- Debian/Ubuntu with `/dev/kvm` (you are in the `kvm`/`libvirt` group — `vm-build` adds you; already-open terminals need a re-login, or use `sg kvm -c "uv run task vm-run"` as a stopgap).
 - **uv** (the project pins Python 3.14, matching the VM/appliance; `vmctl.py` is stdlib-only).
 - `qemu-system-x86_64` and libvirt (installed by `provision.sh` on first run).
 
@@ -100,8 +100,13 @@ uv run task vm-serial
 
 ```sh
 uv run task vm-shot
-# → saves vm/screenshot.png
+# → screenshot saved: vm/screenshot.png  (1280x800)
+uv run task vm-shot --out /tmp/frame.png   # extra args go to vmctl.py screenshot
 ```
+
+Uses QMP `screendump` on `/tmp/rabbitears-qmp.sock`, which every `vm-run` opens.
+It works headless and needs only the stdlib. It exits non-zero and leaves any
+existing file untouched if the VM isn't running or the grab fails.
 
 ---
 

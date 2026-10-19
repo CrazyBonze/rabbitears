@@ -26,9 +26,9 @@ Subcommands:
       Works headless (no VNC/SPICE needed). On success prints the saved path
       and pixel dimensions; on failure prints a warning to stderr and exits 1.
 
-Stdlib only: socket, subprocess, signal, argparse, time, json. The QMP
-screendump PPM->PNG conversion uses Pillow if installed, else ImageMagick's
-`convert`, else copies the PPM as-is. See vm/VAGRANT.md.
+Stdlib only: socket, subprocess, signal, argparse, time, json, struct,
+zlib. The QMP screendump PPM->PNG conversion is a built-in stdlib encoder
+(no Pillow, no ImageMagick). See vm/VAGRANT.md.
 """
 
 from __future__ import annotations
@@ -41,10 +41,12 @@ import os
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -264,43 +266,104 @@ def screendump(monitor_sock: Path | str, output_path: Path | str) -> None:
         sock.close()
 
 
-def ppm_to_png(ppm_path: Path | str, png_path: Path | str) -> None:
-    """Convert QEMU's PPM screendump to a PNG. Never raises.
+def _read_ppm(path: Path | str) -> tuple[int, int, bytes]:
+    """Parse a binary PPM (P6) file; return (width, height, RGB bytes).
 
-    Tries Pillow, then ImageMagick's ``convert``; if neither is available
-    (or both fail), copies the PPM to ``png_path`` unchanged and prints a
-    warning to stderr.
+    The header is parsed as whitespace-separated tokens (magic, width,
+    height, maxval); ``#`` comment lines are skipped. Raises ValueError on
+    any violation: wrong magic, maxval != 255, non-positive dimensions, or
+    pixel data that is not exactly width * height * 3 bytes after the single
+    whitespace byte that ends the header.
+    """
+    data = Path(path).read_bytes()
+    pos = 0
+    tokens: list[bytes] = []
+    for _ in range(4):
+        # Skip whitespace; a ``#`` starts a comment running to end of line.
+        while pos < len(data):
+            byte = data[pos:pos + 1]
+            if byte.isspace():
+                pos += 1
+            elif byte == b"#":
+                while pos < len(data) and data[pos:pos + 1] != b"\n":
+                    pos += 1
+            else:
+                break
+        start = pos
+        while pos < len(data) and not data[pos:pos + 1].isspace():
+            pos += 1
+        tokens.append(data[start:pos])
+    if pos >= len(data) or not data[pos:pos + 1].isspace():
+        raise ValueError(f"{path}: PPM header is truncated")
+    pos += 1  # the single whitespace byte that ends the header
+
+    magic, w_tok, h_tok, maxval_tok = tokens
+    if magic != b"P6":
+        raise ValueError(f"{path}: not a P6 PPM file (magic {magic!r})")
+    try:
+        width, height, maxval = int(w_tok), int(h_tok), int(maxval_tok)
+    except ValueError as e:
+        raise ValueError(f"{path}: non-numeric PPM header field") from e
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{path}: non-positive PPM dimensions {width}x{height}")
+    if maxval != 255:
+        raise ValueError(f"{path}: unsupported PPM maxval {maxval} (need 255)")
+    expected = width * height * 3
+    pixels = data[pos:]
+    if len(pixels) != expected:
+        raise ValueError(
+            f"{path}: expected {expected} pixel bytes for {width}x{height}, "
+            f"got {len(pixels)}"
+        )
+    return width, height, pixels
+
+
+def _encode_png(width: int, height: int, rgb: bytes) -> bytes:
+    """Encode 8-bit RGB pixels as a PNG (colour type 2, filter 0 per row).
+
+    Same pattern as _save_png in tools/generate_testpattern.py; duplicated
+    on purpose — both files are standalone scripts loaded by path.
+    """
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return struct.pack("!I", len(data)) + body + struct.pack("!I", zlib.crc32(body))
+
+    stride = width * 3
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)  # per-scanline filter type: None
+        raw += rgb[y * stride:(y + 1) * stride]
+    ihdr = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(bytes(raw)))
+        + chunk(b"IEND", b"")
+    )
+
+
+def ppm_to_png(ppm_path: Path | str, png_path: Path | str) -> tuple[int, int]:
+    """Convert a PPM screendump to an 8-bit RGB PNG. Returns (width, height).
+
+    Writes ``png_path`` atomically (temp file in the same directory, then
+    ``os.replace``). Raises on any failure; a pre-existing ``png_path`` is
+    left untouched.
     """
     ppm_path, png_path = Path(ppm_path), Path(png_path)
+    width, height, rgb = _read_ppm(ppm_path)
+    png = _encode_png(width, height, rgb)
     png_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(png_path.parent), prefix=".ppm2png-")
     try:
-        from PIL import Image  # optional dependency  # type: ignore[import-not-found]
-
-        with Image.open(ppm_path) as img:
-            img.save(png_path)
-        return
-    except ImportError:
-        pass
-    except Exception as e:  # noqa: BLE001 - fall through to convert
-        print(f"[vmctl] WARNING: PIL PPM->PNG failed ({e}); trying convert", file=sys.stderr)
-    try:
-        subprocess.run(["convert", str(ppm_path), str(png_path)], check=True, capture_output=True)
-        return
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        print(
-            f"[vmctl] WARNING: convert failed ({e}); copying PPM as-is to {png_path}",
-            file=sys.stderr,
-        )
-    png_path.write_bytes(ppm_path.read_bytes())
-
-
-def _ppm_dimensions(ppm_path: Path | str) -> tuple[int, int]:
-    """Read (width, height) from a binary PPM (P6) header: `P6\n<w> <h>\n<maxval>\n`."""
-    with open(ppm_path, "rb") as f:
-        header = f.read(64)
-    if not header.startswith(b"P6"):
-        raise ValueError(f"{ppm_path} is not a P6 PPM file")
-    width, height = (int(part) for part in header.split(b"\n")[1].split())
+        with os.fdopen(fd, "wb") as f:
+            f.write(png)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, png_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
     return width, height
 
 
@@ -310,8 +373,7 @@ def cmd_screenshot(args: argparse.Namespace) -> int:
     ppm = tmpdir / "frame.ppm"
     try:
         screendump(args.monitor, ppm)
-        width, height = _ppm_dimensions(ppm)
-        ppm_to_png(ppm, args.out)
+        width, height = ppm_to_png(ppm, args.out)
         print(f"screenshot saved: {args.out}  ({width}x{height})")
     except Exception as e:  # noqa: BLE001 - diagnostic; report and fail
         print(f"[vmctl] WARNING: QMP screendump failed: {e}", file=sys.stderr)
