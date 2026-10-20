@@ -37,18 +37,24 @@ supervise_daemon_args="--env PYTHONPATH=/opt --env PYTHONDONTWRITEBYTECODE=1"
 respawn_max=0
 respawn_delay=2
 
-# The command to supervise (respawned on exit). Placeholder: no app code yet,
-# so this runs a no-op loop (keeps the service up without a respawn storm).
-# Replace once src/rabbitears/__main__.py is deployed to /opt/rabbitears:
-#   command="/usr/bin/python3"
-#   command_args="-m rabbitears"
-command="/bin/sh"
-command_args="-c 'while :; do sleep 3600; done'"
+# The command to supervise (respawned on exit). The app is installed at
+# /opt/rabbitears; PYTHONPATH=/opt (from supervise_daemon_args) makes it
+# importable. A crash exits non-zero, so supervise-daemon respawns it and the
+# new instance re-tunes (SCOPE §4.7).
+command="/usr/bin/python3"
+command_args="-m rabbitears"
 
 # /run is a tmpfs (cleared at boot); the mpv JSON IPC socket lives at
 # /run/rabbitears/mpv.sock, so create the directory before the daemon starts.
+# Also run the mdev coldplug loop: the stick may already be enumerated before
+# the mdev rule fires at boot, so mount an already-attached RABBITEARS drive
+# here. One mount implementation, shared with hotplug (SCOPE §4.8).
 start_pre() {
 	install -d -m 0755 /run/rabbitears
+	for _dev in /dev/sd*; do
+		[ -e "$_dev" ] || continue
+		MDEV="$(basename "$_dev")" ACTION=add /etc/rabbitears/mdev-usb
+	done
 }
 
 depend() {

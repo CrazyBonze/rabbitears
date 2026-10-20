@@ -203,8 +203,15 @@ class Player:
         self._send(["loadfile", str(path), "replace"])
 
     def load(self, path: Path, offset: float = 0.0) -> None:
-        """Tune to `path` at `offset` seconds into the file (no restart)."""
-        self._send(["loadfile", str(path), "replace", {"start": offset}])
+        """Tune to `path` at `offset` seconds into the file (no restart).
+
+        mpv >= 0.38 (Alpine 3.24 ships 0.41) takes ``loadfile <url> <flags>
+        <index> <options>``: the playlist ``index`` (-1 = n/a with "replace")
+        comes before the options, and option values must be strings. Passing
+        the options dict third, or a float value, gets "invalid parameter"
+        (found by `uv run task vm-e2e`).
+        """
+        self._send(["loadfile", str(path), "replace", -1, {"start": f"{offset:.3f}"}])
 
     def set_volume(self, volume: int) -> None:
         """Set mpv volume (0-100)."""
@@ -213,6 +220,10 @@ class Player:
     def set_mute(self, muted: bool) -> None:
         """Enable or disable mute."""
         self._send(["set_property", "mute", bool(muted)])
+
+    def set_pause(self, paused: bool) -> None:
+        """Pause or resume playback (used for the info overlay / guide)."""
+        self._send(["set_property", "pause", bool(paused)])
 
     def hide_video(self) -> None:
         """Hide video (standby): mpv keeps running, screen goes black."""

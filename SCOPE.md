@@ -144,6 +144,14 @@ which treats it as standby.
   Python, no udev/by-id dependency), `grab()` them exclusively, and filter by
   code.
 - Hot-plug: rescan every few seconds if the dongle disappears.
+- **Hold-to-repeat** (channel up/down only): the first repeat fires after
+  `repeat_delay` (0.5 s), then every `repeat_interval` (0.4 s) while held.
+- **Volume:** each press steps by `volume_step` (5), clamped to `0..volume_cap`
+  (80). A volume press unmutes, like a real TV. Volume persists (throttled to
+  at most one `state.json` write per 2 s).
+- The app is the only actor on a button: the evdev daemon writes one line per
+  button to a FIFO, the app maps buttons to a `Command` (`commands.py`) and
+  runs it through `App.handle` (§10).
 
 ### 4.5 On-screen display
 - **Channel flash:** on every tune, show `CH 03` in blocky green
@@ -157,6 +165,8 @@ which treats it as standby.
 - Power → black screen + mute. mpv keeps running, but video is hidden.
 - Waking re-tunes the last channel at the **current** schedule position, so
   time keeps passing while "off," just like real TV.
+- While in standby, **only Power has any effect**; every other button is
+  ignored.
 
 ### 4.7 Failure screens
 - **No USB / no channels:** full-screen test pattern with "NO SIGNAL."
@@ -166,9 +176,9 @@ which treats it as standby.
 - **mpv crash:** the service supervisor restarts it, and the app re-tunes.
 
 ### 4.8 Boot
-Power on → OpenRC starts `rabbitears` → mount the USB drive by label
-`RABBITEARS` → tune to the last channel from `state.json`, or the lowest
-channel if there's no state → channel flash.
+Power on → OpenRC starts `rabbitears` → mdev mounts the drive by label
+`RABBITEARS` on hotplug and at boot → tune to the last channel from
+`state.json`, or the lowest channel if there's no state → channel flash.
 
 ---
 
@@ -195,21 +205,33 @@ rabbitears/
 │   ├── hardware.md           # 3040 notes, BIOS settings, adapters, video chain
 │   └── alpine-install.md     # step-by-step diskless install + lbu procedure
 ├── src/rabbitears/
-│   ├── __main__.py           # entry point, main loop
+│   ├── __main__.py           # thin entry point (python -m rabbitears)
+│   ├── app.py                # the app: state machine, tuning, failure recovery
 │   ├── config.py             # defaults + /etc/rabbitears/config.toml
 │   ├── channels.py           # scan USB, parse folders, channel.toml
 │   ├── schedule.py           # clock-based position math (pure, unit-tested)
 │   ├── index.py              # duration cache read/write (index.json)
 │   ├── player.py             # mpv process + JSON IPC wrapper
-│   ├── remote.py             # evdev discovery, grab, repeat, hot-plug
+│   ├── commands.py           # the Command vocabulary (parse_command) — shared contract
+│   ├── remote.py             # button map, wire format, KeyRepeater, Remote (pure)
+│   ├── evdevd.py             # evdev daemon: find remote, read EV_KEY, write the FIFO
+│   ├── control.py            # local root-only control socket (commands + status)
+│   ├── ctl.py                # control-socket client (python -m rabbitears.ctl)
 │   ├── osd.py                # channel flash + info overlay formatting
 │   └── state.py              # last channel / volume persistence on USB
 ├── system/
 │   ├── openrc/rabbitears     # init script (supervise-daemon, respawn)
+│   ├── openrc/rabbitears-remote  # evdev daemon service (supervise-daemon)
 │   ├── mpv/mpv.conf          # VAAPI, DRM output, OSD styling
-│   ├── acpid/                # power-button override
-│   ├── fstab.snippet         # LABEL=RABBITEARS mount
+│   ├── mdev/                 # hotplug mount: rabbitears-usb + mdev.conf.snippet
+│   ├── acpid/                # power-button override: PWRF + PWRB no-op hooks
 │   └── fonts/                # bundled pixel font (with license file)
+├── vm/
+│   ├── provision.sh          # build the KVM VM (libvirt, unattended install)
+│   ├── install.py            # drives setup-alpine over the serial console (transcript, watchdogs)
+│   ├── vmctl.py              # run the VM in raw QEMU (screenshot, usb + remote plug/unplug, key, powerbutton, stop)
+│   ├── e2e.py                # end-to-end pipeline check (vm-e2e)
+│   └── make-usb.sh           # build the mock USB stick image (exFAT, RABBITEARS)
 ├── alpine/
 │   ├── packages.txt          # one package per line; source of truth
 │   ├── setup.sh              # idempotent: apk add, copy system/, rc-update, lbu include
@@ -219,6 +241,7 @@ rabbitears/
 ├── tools/
 │   ├── transcode.sh          # desktop: anything → 720p H.264/AAC MP4
 │   ├── index.py              # desktop/box: ffprobe durations → index.json
+│   ├── e2e-remote.py         # e2e remote test double (writes button lines to the FIFO)
 │   └── testpattern.png       # NO SIGNAL screen
 ├── media-example/            # tiny sample layout, for docs and tests
 │   └── channels/03-sample/...
@@ -246,10 +269,17 @@ rabbitears/
 /opt/rabbitears/              # src/rabbitears (lbu include)
 /usr/share/rabbitears/testpattern.png  # NO SIGNAL screen (lbu include)
 /etc/rabbitears/config.toml   # epoch, volume cap, OSD settings
+/etc/rabbitears/mdev-usb      # mdev hotplug handler (mounts the drive by label)
 /etc/rabbitears/manifest      # install manifest (hashes of managed files)
 /etc/mpv/mpv.conf
 /etc/init.d/rabbitears
+/etc/init.d/rabbitears-remote # evdev daemon service
+/etc/acpi/PWRF/00000080      # busybox acpid: remote KEY_POWER -> logged no-op (SCOPE §3)
+/etc/acpi/PWRB/00000080      # busybox acpid: ACPI power button -> logged no-op (SCOPE §3)
+/run/rabbitears/control.sock # control socket (runtime, tmpfs; root-only)
+/usr/share/rabbitears/e2e-remote.py  # e2e remote test double
 /var/log/rabbitears.log       # app log (RAM-backed, non-persistent)
+/var/log/rabbitears-remote.log  # daemon log (RAM-backed, non-persistent)
 /media/rabbitears/            # USB mount point
 ```
 
@@ -284,8 +314,9 @@ rabbitears/
 - [ ] **M2 — Playback core.** Channel scan + clock schedule + single-mpv tuning,
       driven from an SSH test command. Unit tests pass.
 - [ ] **M3 — Remote.** evdev input with up/down/OK/back/vol/mute/power working,
-      plus hold-to-repeat and power-key override.
-- [ ] **M4 — OSD + standby.** Green channel flash, info overlay, standby/wake.
+      plus hold-to-repeat, standby/wake, the control socket, and the power-key
+      override.
+- [ ] **M4 — OSD.** Green channel flash and the info overlay (OK/Back).
 - [ ] **M5 — Appliance hardening.** OpenRC respawn, NO SIGNAL screen, USB
       hot-plug, unplayable-file skip, pull-the-plug tests (×20).
 - [ ] **M6 — Reproducibility.** Box B rebuilt from repo + `apkovl`, identical to A.
@@ -324,11 +355,18 @@ Ideas we want eventually but will **not** start before v1.0:
 | 2026-10-18 | deploy via tar over ssh | No rsync dependency; a fresh box has only the base install |
 | 2026-10-18 | VM validates the output path, not VAAPI | virtio-gpu has no VAAPI/i965; hwdec is checked only on the 3040 |
 | 2026-10-18 | taskipy tasks as entry points; manifest + verify.sh drift check | Every common action is `uv run task …`; drift is detected, not discovered |
+| 2026-10-19 | mdev hotplug mount by label, no fstab entry | One mount path for VM and box; the drive mounts when it appears and lazily unmounts when it goes |
+| 2026-10-19 | VM media is an emulated USB stick, not 9p | Exercises the label lookup, mdev rule, exFAT driver, and pull-the-plug behaviour |
+| 2026-10-19 | `vm-e2e` is the pipeline's acceptance test | One command proves build → deploy → mount → schedule-correct playback → pull/re-insert → crash recovery; replaces hand-run checklists |
+| 2026-10-19 | VM install fails fast with a serial transcript; one QEMU per disk enforced | A silent 30-min hang with no console log made install failures undiagnosable |
+| 2026-10-20 | evdev daemon writes button lines to a FIFO; the app is the only actor | One input path (daemon/test double → FIFO → app); the app decides every action, so the remote logic is testable without a physical remote (the VM drives it with a test double) |
+| 2026-10-20 | Input sources → `Command` → `App.handle`; sources are swappable | `commands.py` is the one action vocabulary; remote, control socket, and any future source all funnel into `handle`, so the surface stays closed |
+| 2026-10-20 | Local root-only control socket for tests/automation; commands + status only, no network | A scripted, read-only probe over SSH (`rabbitears.ctl`); nothing that isn't a `Command` or a read-only `status` |
+| 2026-10-20 | Neither the remote nor the ACPI power button shuts the box down | busybox acpid PWRF/PWRB hooks make both a logged no-op; the app's KEY_POWER is standby; recovery from anything is pulling the plug |
+| 2026-10-20 | QEMU `usb-kbd` (vendor 0x0627) stands in for the remote in the VM | The app's real vendor scan finds it with no VM branch |
 
 ## 11. Open questions
 - 8GB or 16GB eMMC on each unit? (Affects apk cache headroom.)
-- exFAT or ext4 for the USB drive? (exFAT is easy to load from any PC; ext4
-  is more robust against pulled plugs.)
 - Audio path: does the HDMI→composite converter pass audio, or do we need the
   3040's headphone jack into the TV?
 - Volume cap value for a kid's room.

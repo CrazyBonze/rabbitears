@@ -18,6 +18,12 @@ Both functions here are pure: no I/O, no global state.
 
 from __future__ import annotations
 
+from typing import TypeVar
+
+# The playlist entry's first element is opaque to the schedule math (a str or
+# a Path); it is only compared and returned, never inspected.
+_T = TypeVar("_T")
+
 
 def compute_position(epoch: float, loop_length: float, now: float) -> float:
     """Return the playback position in [0, loop_length) for time `now`.
@@ -35,7 +41,7 @@ def compute_position(epoch: float, loop_length: float, now: float) -> float:
     return (now - epoch) % loop_length
 
 
-def find_file(files: list[tuple[str, float]], position: float) -> tuple[str, float]:
+def find_file(files: list[tuple[_T, float]], position: float) -> tuple[_T, float]:
     """Return (path, offset) for the file containing `position`.
 
     `files` is a list of (path, duration) tuples in playlist order.

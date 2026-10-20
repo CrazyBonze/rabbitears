@@ -318,6 +318,26 @@ class ShowImageTest(unittest.TestCase):
                 fake.stop()
 
 
+class LoadTest(unittest.TestCase):
+    def test_load_uses_the_mpv_038_loadfile_signature(self):
+        # mpv >= 0.38: loadfile <url> <flags> <index> <options>, with string
+        # option values. The old form (options third, float value) is rejected
+        # by mpv 0.41 with "invalid parameter" — verified on the VM.
+        with tempfile.TemporaryDirectory() as tmp:
+            sock_path = Path(tmp) / "mpv.sock"
+            fake = FakeMpv(sock_path)
+            fake.set_responses([{"error": "success", "request_id": 1}])
+            fake.start()
+            try:
+                player = Player(socket_path=sock_path)
+                player.load(Path("/media/rabbitears/channels/01-a/x.mp4"), 21.0039579)
+                cmd = fake.received[0]["command"]
+                self.assertEqual(cmd, ["loadfile", "/media/rabbitears/channels/01-a/x.mp4",
+                                       "replace", -1, {"start": "21.004"}])
+            finally:
+                fake.stop()
+
+
 class StartTest(unittest.TestCase):
     def test_start_raises_timeout_if_socket_never_appears(self):
         with tempfile.TemporaryDirectory() as tmp:

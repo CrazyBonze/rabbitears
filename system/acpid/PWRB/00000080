@@ -1,0 +1,7 @@
+#!/bin/sh
+# Rabbit Ears — power-button override (SCOPE §3).
+#
+# busybox acpid runs this via run-parts for a "button/power PWRB" event, i.e.
+# the physical/ACPI power button. It must never shut the box down; recovery
+# from anything is pulling the plug (SCOPE §1 goal 2). Logged no-op.
+logger -t rabbitears-power "power button (PWRB) ignored (SCOPE §3)"

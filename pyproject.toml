@@ -41,10 +41,20 @@ vm-status = { cmd = "./vm/provision.sh status", help = "Show VM, ISO and disk st
 vm-run = { cmd = "python vm/vmctl.py run", help = "Boot the VM in QEMU and stream its serial console" }
 vm-serial = { cmd = "python vm/vmctl.py serial", help = "Attach to the running VM's serial console" }
 vm-shot = { cmd = "python vm/vmctl.py screenshot", help = "Screenshot the running VM to vm/screenshot.png" }
-vm-stop = { cmd = "./vm/provision.sh stop", help = "Shut the VM domain down (idempotent)" }
+vm-stop = { cmd = "python vm/vmctl.py stop && ./vm/provision.sh stop", help = "Stop the VM (vmctl QEMU + libvirt domain) and verify no QEMU still holds the disk" }
+vm-install-log = { cmd = "tail -n 60 /var/lib/rabbitears-vm/install-serial.log", help = "Show the end of the last base install's serial transcript (where vm-build hung/failed)" }
+vm-e2e = { cmd = "python vm/e2e.py", help = "End-to-end check: boot VM + stick, deploy, verify mount/playback/schedule/unplug/replug/crash (append --rebuild for a fresh VM)" }
 deploy-vm = { cmd = "alpine/deploy.sh --vm --reboot", help = "Deploy the repo to the VM, reboot, and verify" }
 vm-verify = { cmd = "alpine/verify.sh --vm", help = "Read-only drift check against the VM" }
 deploy-box = { cmd = "alpine/deploy.sh --commit --reboot", help = "Deploy to a box (append --host H); commits + reboots" }
 box-verify = { cmd = "alpine/verify.sh", help = "Read-only drift check against a box (append --host H)" }
 transcode = { cmd = "tools/transcode.sh", help = "Transcode media to SCOPE §5 compliance (append SRC_DIR DEST_DIR)" }
 media-check = { cmd = "tools/transcode.sh --check", help = "Check media files for SCOPE §5 compliance (append DIR)" }
+usb-build = { cmd = "./vm/make-usb.sh", help = "Build the mock USB stick image from the staging dir (append --reformat / --reset-state)" }
+vm-run-usb = { cmd = "python vm/vmctl.py run --usb /var/lib/rabbitears-vm/usb.img", help = "Boot the VM in QEMU with the mock USB stick attached" }
+usb-unplug = { cmd = "python vm/vmctl.py usb unplug", help = "Hot-unplug the mock USB stick from the running VM" }
+usb-plug = { cmd = "python vm/vmctl.py usb plug", help = "Re-insert the mock USB stick into the running VM" }
+vm-key = { cmd = "python vm/vmctl.py key", help = "Press a remote button in the VM (append BUTTON [--hold S]; e.g. up, volup, power, left)" }
+remote-unplug = { cmd = "python vm/vmctl.py remote unplug", help = "Hot-unplug the emulated remote (usb-kbd) from the running VM" }
+remote-plug = { cmd = "python vm/vmctl.py remote plug", help = "Re-insert the emulated remote (usb-kbd) into the running VM" }
+vm-powerbutton = { cmd = "python vm/vmctl.py powerbutton", help = "Press the ACPI power button in the VM (QMP system_powerdown)" }

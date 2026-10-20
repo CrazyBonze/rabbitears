@@ -36,6 +36,16 @@ class Config:
     epoch: float = 0.0
     # Maximum volume, 0-100 (SCOPE §4.4: volume is clamped to a max cap).
     volume_cap: int = 80
+    # Volume change per VOLUME_UP/DOWN press (invalid if < 1).
+    volume_step: int = 5
+    # Seconds a channel key must be held before it starts repeating (SCOPE §4.4).
+    repeat_delay: float = 0.5
+    # Seconds between repeats while held (invalid if < 0.1).
+    repeat_interval: float = 0.4
+    # USB vendor ID the remote scan looks for (SCOPE §4.4: Adomax 0x0627).
+    remote_vendor: int = 0x0627
+    # Local root-only control socket (commands + read-only status).
+    control_socket: Path = field(default_factory=lambda: Path("/run/rabbitears/control.sock"))
     # OSD channel-flash color (SCOPE §4.5: blocky green).
     osd_color: str = "#33CC33"
     # Channel-flash duration in seconds (SCOPE §4.5: about 2.5s).
@@ -44,6 +54,8 @@ class Config:
     osd_font_size: int = 72
     # mpv JSON IPC socket (SCOPE §4.3).
     socket_path: Path = field(default_factory=lambda: Path("/run/rabbitears/mpv.sock"))
+    # Button FIFO: the evdev daemon (writer) -> the app (reader) (SCOPE §4.4).
+    buttons_path: Path = field(default_factory=lambda: Path("/run/rabbitears/buttons"))
     # USB drive mount point (SCOPE §3, §6).
     mount_point: Path = field(default_factory=lambda: Path("/media/rabbitears"))
     # NO SIGNAL test pattern image (SCOPE §4.7).
@@ -103,13 +115,28 @@ def load_config(path: Path = _DEFAULT_CONFIG_PATH) -> Config:
     if not isinstance(data, dict):
         data = {}
 
+    # Coerce first, then apply range checks: a value that parses but is out of
+    # range falls back to that key's default (per-key fallback, never a crash).
+    volume_step = _as_int(data.get("volume_step"), _DEFAULTS.volume_step)
+    if volume_step < 1:
+        volume_step = _DEFAULTS.volume_step
+    repeat_interval = _as_float(data.get("repeat_interval"), _DEFAULTS.repeat_interval)
+    if repeat_interval < 0.1:
+        repeat_interval = _DEFAULTS.repeat_interval
+
     return Config(
         epoch=_as_float(data.get("epoch"), _DEFAULTS.epoch),
         volume_cap=_as_int(data.get("volume_cap"), _DEFAULTS.volume_cap),
+        volume_step=volume_step,
+        repeat_delay=_as_float(data.get("repeat_delay"), _DEFAULTS.repeat_delay),
+        repeat_interval=repeat_interval,
+        remote_vendor=_as_int(data.get("remote_vendor"), _DEFAULTS.remote_vendor),
+        control_socket=_as_path(data.get("control_socket"), _DEFAULTS.control_socket),
         osd_color=_as_str(data.get("osd_color"), _DEFAULTS.osd_color),
         osd_duration=_as_float(data.get("osd_duration"), _DEFAULTS.osd_duration),
         osd_font_size=_as_int(data.get("osd_font_size"), _DEFAULTS.osd_font_size),
         socket_path=_as_path(data.get("socket_path"), _DEFAULTS.socket_path),
+        buttons_path=_as_path(data.get("buttons_path"), _DEFAULTS.buttons_path),
         mount_point=_as_path(data.get("mount_point"), _DEFAULTS.mount_point),
         testpattern_path=_as_path(data.get("testpattern_path"), _DEFAULTS.testpattern_path),
     )

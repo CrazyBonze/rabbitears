@@ -1,0 +1,68 @@
+#!/bin/sh
+# Rabbit Ears — mdev hotplug mount for the media drive (SCOPE §4.8).
+#
+# Installed to /etc/rabbitears/mdev-usb by alpine/setup.sh. It lives under
+# /etc so lbu persists it; /lib/mdev/ would vanish on the diskless box.
+#
+# Invoked two ways, both through this one script:
+#   * the /etc/mdev.conf rule, for every /dev/sd* node on hotplug, and
+#   * the init script's start_pre() coldplug loop, at boot (the stick may
+#     already be enumerated before the rule fires).
+#
+# POSIX sh / busybox only. It must be fast and must NEVER block mdev: every
+# path exits promptly, and a failure to mount just logs and returns.
+#
+# Inputs (set by mdev):
+#   MDEV    device node name, e.g. "sda1" (or "sda" for an unpartitioned stick)
+#   ACTION  "add" or "remove". During coldplug (`mdev -s`) busybox leaves
+#           ACTION empty, so an empty ACTION is treated as "add" below.
+#           (Verified on the VM during e2e: coldplug -> ACTION="".)
+#
+# Only the drive labelled RABBITEARS is mounted, at /media/rabbitears. Any
+# other USB device is ignored.
+
+MDEV="${MDEV:-}"
+ACTION="${ACTION:-add}"   # empty ACTION (coldplug) is treated as an add
+
+[ -n "$MDEV" ] || exit 0
+
+# --- add: mount the RABBITEARS drive if it isn't already a mountpoint ---
+if [ "$ACTION" = "add" ]; then
+	# Already mounted? Nothing to do. (After a lazy unmount the entry is
+	# gone from /proc/mounts immediately, so a re-inserted drive re-mounts.)
+	if grep -q ' /media/rabbitears ' /proc/mounts; then
+		exit 0
+	fi
+
+	# Identify the device. Only our labelled drive is of interest.
+	label="$(blkid -s LABEL -o value "/dev/$MDEV" 2>/dev/null)"
+	[ "$label" = "RABBITEARS" ] || exit 0
+
+	type="$(blkid -s TYPE -o value "/dev/$MDEV" 2>/dev/null)"
+	[ -n "$type" ] || exit 0
+
+	# RAM root: /media/rabbitears does not survive reboot, so create it.
+	mkdir -p /media/rabbitears
+
+	# Pass -t explicitly: busybox mount only auto-detects filesystems already
+	# in /proc/filesystems, and exfat isn't loaded until something asks for it.
+	if mount -t "$type" -o rw,noatime "/dev/$MDEV" /media/rabbitears 2>/dev/null; then
+		logger -t rabbitears-usb "mounted /dev/$MDEV ($type, label RABBITEARS) at /media/rabbitears"
+	else
+		logger -t rabbitears-usb "failed to mount /dev/$MDEV at /media/rabbitears"
+	fi
+	exit 0
+fi
+
+# --- remove: lazily unmount if this device is the one on /media/rabbitears ---
+if [ "$ACTION" = "remove" ]; then
+	if grep -q "/dev/$MDEV[[:space:]]/media/rabbitears[[:space:]]" /proc/mounts; then
+		# Lazy is required: mpv holds the playing file open, so a plain umount
+		# fails with EBUSY and leaves a dead mount behind.
+		umount -l /media/rabbitears 2>/dev/null
+		logger -t rabbitears-usb "lazy-unmounted /media/rabbitears (/dev/$MDEV removed)"
+	fi
+	exit 0
+fi
+
+exit 0

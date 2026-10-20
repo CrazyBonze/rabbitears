@@ -1,0 +1,49 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Rabbit Ears — evdev remote daemon OpenRC init script.
+#
+# Runs the evdev daemon (src/rabbitears/evdevd.py) under supervise-daemon. The
+# daemon finds the Adomax remote's evdev nodes, reads EV_KEY events, and writes
+# one line per button to the FIFO the app reads (SCOPE §4.4). It never touches
+# mpv — the app is the only process that acts on a button.
+#
+# Same pattern as the `rabbitears` service: declare `command` + `command_args`
+# and let supervise-daemon handle start/stop/status. Do NOT define manual
+# start()/stop() here.
+#
+# Installed to /etc/init.d/rabbitears-remote by alpine/setup.sh.
+
+name="rabbitears-remote"
+description="Rabbit Ears evdev remote daemon (button lines -> FIFO)"
+
+supervisor=supervise-daemon
+
+# /var/log is RAM-backed on the diskless box and discarded at reboot (intended,
+# logs only).
+output_log="/var/log/rabbitears-remote.log"
+error_log="/var/log/rabbitears-remote.log"
+
+# PYTHONPATH=/opt so the supervised process imports the package at /opt/rabbitears.
+supervise_daemon_args="--env PYTHONPATH=/opt --env PYTHONDONTWRITEBYTECODE=1"
+
+# Respawn forever: if the app (the FIFO reader) is down, the daemon's open fails
+# and it exits; the supervisor restarts it until the app is back.
+respawn_max=0
+respawn_delay=2
+
+command="/usr/bin/python3"
+command_args="-m rabbitears.evdevd"
+
+# /run is a tmpfs (cleared at boot); the button FIFO lives at
+# /run/rabbitears/buttons. Create the directory before the daemon starts. The
+# app creates the FIFO itself (it's the reader); the daemon just opens it.
+start_pre() {
+	install -d -m 0755 /run/rabbitears
+}
+
+depend() {
+	need localmount
+	after bootmisc
+	use net
+}

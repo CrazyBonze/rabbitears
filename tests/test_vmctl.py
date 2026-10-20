@@ -10,6 +10,7 @@ path rather than imported by name.
 import functools
 import importlib.util
 import io
+import json
 import signal
 import struct
 import subprocess
@@ -92,6 +93,9 @@ class VmRunTest(unittest.TestCase):
                 "-device", "virtio-net-pci,netdev=net0",
                 "-serial", "tcp:127.0.0.1:4321,server,nowait",
                 "-display", "none",
+                # The emulated remote is attached by default (Part 4).
+                "-device", "qemu-xhci,id=xhci",
+                "-device", "usb-kbd,bus=xhci.0,id=remote0",
             ]
             with mock.patch.object(vmctl.subprocess, "Popen") as popen:
                 vm = vmctl.Vm(disk=disk)
@@ -107,6 +111,10 @@ class VmRunTest(unittest.TestCase):
         self.assertEqual(args.disk, vmctl.DEFAULT_DISK)
 
 
+def _no_holders(disk):
+    return []
+
+
 class PreflightTest(unittest.TestCase):
     def test_preflight_refuses_when_libvirt_domain_running(self):
         """preflight exits 1 when virsh reports the domain as running."""
@@ -114,7 +122,7 @@ class PreflightTest(unittest.TestCase):
         fake_run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="running\n"))
         fake_access = mock.Mock(return_value=True)
         with self.assertRaises(SystemExit) as ctx:
-            vmctl.preflight(disk, run=fake_run, access=fake_access)
+            vmctl.preflight(disk, run=fake_run, access=fake_access, find_holders=_no_holders)
         self.assertEqual(ctx.exception.code, 1)
 
     def test_preflight_skips_domain_check_when_virsh_missing(self):
@@ -123,7 +131,7 @@ class PreflightTest(unittest.TestCase):
         fake_run = mock.Mock(side_effect=FileNotFoundError("virsh not found"))
         fake_access = mock.Mock(return_value=True)
         # Should not raise — virsh missing is OK, disk is writable.
-        vmctl.preflight(disk, run=fake_run, access=fake_access)
+        vmctl.preflight(disk, run=fake_run, access=fake_access, find_holders=_no_holders)
 
     def test_preflight_refuses_unwritable_disk(self):
         """preflight exits 1 when the disk is not readable/writable."""
@@ -131,7 +139,7 @@ class PreflightTest(unittest.TestCase):
         fake_run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="shut off\n"))
         fake_access = mock.Mock(return_value=False)
         with self.assertRaises(SystemExit) as ctx:
-            vmctl.preflight(disk, run=fake_run, access=fake_access)
+            vmctl.preflight(disk, run=fake_run, access=fake_access, find_holders=_no_holders)
         self.assertEqual(ctx.exception.code, 1)
 
     def test_preflight_passes_when_domain_off_and_disk_writable(self):
@@ -140,7 +148,158 @@ class PreflightTest(unittest.TestCase):
         fake_run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="shut off\n"))
         fake_access = mock.Mock(return_value=True)
         # Should not raise.
-        vmctl.preflight(disk, run=fake_run, access=fake_access)
+        vmctl.preflight(disk, run=fake_run, access=fake_access, find_holders=_no_holders)
+
+    def test_preflight_refuses_when_a_qemu_holds_the_disk(self):
+        """A stale `vm-run` QEMU on the disk (Issue 1 in vm-e2e-blockers.md)."""
+        disk = Path("/var/lib/libvirt/images/rabbitears-vm.qcow2")
+        stale = vmctl.Holder(pid=2766722, argv=["qemu-system-x86_64", f"file={disk}"],
+                             libvirt=False)
+        fake_run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="shut off\n"))
+        stderr = io.StringIO()
+        with mock.patch.object(vmctl.sys, "stderr", stderr), \
+                self.assertRaises(SystemExit) as ctx:
+            vmctl.preflight(disk, run=fake_run, access=mock.Mock(return_value=True),
+                            find_holders=lambda d: [stale])
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("2766722", stderr.getvalue())
+        self.assertIn("vm-stop", stderr.getvalue())
+
+
+def _fake_proc(root: Path, procs: dict[int, list[str]]) -> None:
+    """Lay out /proc/<pid>/cmdline files (NUL-separated argv) under root."""
+    for pid, argv in procs.items():
+        d = root / str(pid)
+        d.mkdir()
+        (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+    (root / "self").mkdir()  # non-numeric entries are ignored
+    (root / "meminfo").write_text("x")
+
+
+class FindDiskHoldersTest(unittest.TestCase):
+    DISK = "/var/lib/libvirt/images/rabbitears-vm.qcow2"
+
+    def test_finds_raw_and_libvirt_qemu_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _fake_proc(root, {
+                100: ["/usr/bin/qemu-system-x86_64", "-drive", f"file={self.DISK},if=virtio"],
+                200: ["/usr/bin/qemu-system-x86_64", "-name", "guest=rabbitears-vm,debug-threads=on",
+                      "-blockdev", f'{{"driver":"file","filename":"{self.DISK}"}}'],
+                # The pkill -f self-match hazard: a shell whose command line
+                # mentions the disk is not a holder.
+                300: ["bash", "-c", f"pkill -f {self.DISK}"],
+                400: ["/usr/bin/qemu-system-x86_64", "-drive", "file=/other.qcow2"],
+                500: ["/usr/bin/qemu-system-x86_64", "-drive", f"file={self.DISK}"],
+            })
+            holders = vmctl.find_disk_holders(self.DISK, proc_root=root, self_pid=500)
+        self.assertEqual([h.pid for h in holders], [100, 200])
+        self.assertFalse(holders[0].libvirt)
+        self.assertTrue(holders[1].libvirt)
+        self.assertIn("vmctl/raw QEMU", holders[0].describe())
+        self.assertIn("libvirt", holders[1].describe())
+
+    def test_missing_proc_returns_empty(self):
+        self.assertEqual(vmctl.find_disk_holders(self.DISK, proc_root="/nonexistent-proc"), [])
+
+
+class StopHoldersTest(unittest.TestCase):
+    def _clock(self):
+        t = [0.0]
+        return (lambda: t[0]), (lambda d: t.__setitem__(0, t[0] + d))
+
+    def test_sigterm_is_enough(self):
+        clock, sleep = self._clock()
+        alive = {100}
+        sent = []
+
+        def kill(pid, sig):
+            sent.append((pid, sig))
+            alive.discard(pid)
+
+        h = vmctl.Holder(100, ["qemu"], False)
+        left = vmctl.stop_holders([h], kill=kill, alive=lambda p: p in alive,
+                                  sleep=sleep, clock=clock)
+        self.assertEqual(left, [])
+        self.assertEqual(sent, [(100, signal.SIGTERM)])
+
+    def test_escalates_to_sigkill_and_verifies(self):
+        clock, sleep = self._clock()
+        alive = {100}
+        sent = []
+
+        def kill(pid, sig):
+            sent.append(sig)
+            if sig == signal.SIGKILL:
+                alive.discard(pid)
+
+        left = vmctl.stop_holders([vmctl.Holder(100, ["qemu"], False)], kill=kill,
+                                  alive=lambda p: p in alive, sleep=sleep, clock=clock)
+        self.assertEqual(left, [])
+        self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
+
+    def test_reports_survivors(self):
+        clock, sleep = self._clock()
+        h = vmctl.Holder(100, ["qemu"], False)
+        left = vmctl.stop_holders([h], kill=lambda p, s: None, alive=lambda p: True,
+                                  sleep=sleep, clock=clock)
+        self.assertEqual(left, [h])
+
+
+class CmdStopTest(unittest.TestCase):
+    def test_stops_raw_and_leaves_libvirt_to_provision(self):
+        raw = vmctl.Holder(100, ["qemu"], False)
+        lv = vmctl.Holder(200, ["qemu", "guest=rabbitears-vm,"], True)
+        stop = mock.Mock(return_value=[])
+        with mock.patch.object(vmctl.sys, "stdout", io.StringIO()) as out:
+            rc = vmctl.cmd_stop(SimpleNamespace(disk="d"), find_holders=lambda d: [raw, lv],
+                                stop=stop)
+        self.assertEqual(rc, 0)
+        stop.assert_called_once_with([raw])
+        self.assertIn("left to provision.sh stop", out.getvalue())
+
+    def test_nothing_to_stop(self):
+        stop = mock.Mock()
+        with mock.patch.object(vmctl.sys, "stdout", io.StringIO()):
+            rc = vmctl.cmd_stop(SimpleNamespace(disk="d"), find_holders=lambda d: [], stop=stop)
+        self.assertEqual(rc, 0)
+        stop.assert_not_called()
+
+    def test_survivor_fails(self):
+        raw = vmctl.Holder(100, ["qemu"], False)
+        with mock.patch.object(vmctl.sys, "stdout", io.StringIO()), \
+                mock.patch.object(vmctl.sys, "stderr", io.StringIO()) as err:
+            rc = vmctl.cmd_stop(SimpleNamespace(disk="d"), find_holders=lambda d: [raw],
+                                stop=lambda hs: hs)
+        self.assertEqual(rc, 1)
+        self.assertIn("still running", err.getvalue())
+
+    def test_parser_has_stop(self):
+        args = vmctl._build_parser().parse_args(["stop"])
+        self.assertEqual(args.disk, vmctl.DEFAULT_DISK)
+
+
+class QemuLifetimeTest(unittest.TestCase):
+    """A QEMU must never outlive the vmctl that started it."""
+
+    def test_run_sets_pdeathsig_in_the_child(self):
+        with mock.patch.object(vmctl.subprocess, "Popen") as popen:
+            vmctl.Vm(disk=Path("x")).run()
+        self.assertIs(popen.call_args.kwargs["preexec_fn"], vmctl._set_pdeathsig)
+
+    def test_cmd_run_handles_sigterm_and_sighup(self):
+        args = SimpleNamespace(disk="d", display="none", monitor="", usb=None,
+                               host="127.0.0.1", port=4321, remote=True)
+        registered = {}
+        with mock.patch.object(vmctl, "preflight"), \
+                mock.patch.object(vmctl, "Vm") as vm_cls, \
+                mock.patch.object(vmctl, "_stream_serial"), \
+                mock.patch.object(vmctl.signal, "signal",
+                                  side_effect=lambda s, h: registered.__setitem__(s, h)):
+            vm_cls.return_value.wait.return_value = 0
+            vmctl.cmd_run(args)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            self.assertIn(sig, registered)
 
 
 class VmWaitTest(unittest.TestCase):
@@ -496,6 +655,202 @@ class TestPatternTest(unittest.TestCase):
             gw, gh, _, _, g_rgb = _decode_png(out.read_bytes())
             self.assertEqual((aw, ah), (gw, gh))
             self.assertEqual(a_rgb, g_rgb)
+
+
+class UsbArgsTest(unittest.TestCase):
+    """qemu_args() with a mock USB stick image attached."""
+
+    def test_qemu_args_usb_image(self):
+        img = "/var/lib/rabbitears-vm/usb.img"
+        args = vmctl.qemu_args(Path("disk.qcow2"), usb_image=img)
+        # All four argument pairs are present, with the correct image path.
+        self.assertIn("qemu-xhci,id=xhci", args)
+        self.assertIn(f"driver=file,filename={img},node-name=usbfile", args)
+        self.assertIn("driver=raw,file=usbfile,node-name=usbstick", args)
+        self.assertIn("usb-storage,bus=xhci.0,drive=usbstick,id=usbstick0,removable=on", args)
+        # The stick image is attached via -blockdev, never -drive.
+        drive_args = [args[i + 1] for i, a in enumerate(args) if a == "-drive"]
+        self.assertFalse(any(img in d for d in drive_args), "stick must use -blockdev, not -drive")
+        # The system disk still uses -drive.
+        self.assertIn("-drive", args)
+
+    def test_qemu_args_no_usb_by_default(self):
+        # No stick by default: xhci + usb-kbd (the remote) are present, but no
+        # usb-storage / usbstick blockdev.
+        args = vmctl.qemu_args(Path("disk.qcow2"))
+        self.assertIn("qemu-xhci,id=xhci", args)
+        self.assertIn("usb-kbd,bus=xhci.0,id=remote0", args)
+        self.assertNotIn("usb-storage,bus=xhci.0,drive=usbstick,id=usbstick0,removable=on", args)
+        self.assertNotIn("node-name=usbstick", args)
+
+
+class RemoteArgsTest(unittest.TestCase):
+    """qemu_args() remote (usb-kbd) emission + xhci exactly-once."""
+
+    def test_remote_attached_by_default(self):
+        args = vmctl.qemu_args(Path("disk.qcow2"))
+        self.assertIn("usb-kbd,bus=xhci.0,id=remote0", args)
+        self.assertIn("qemu-xhci,id=xhci", args)
+
+    def test_no_remote_omits_it(self):
+        args = vmctl.qemu_args(Path("disk.qcow2"), remote=False)
+        self.assertNotIn("usb-kbd,bus=xhci.0,id=remote0", args)
+        self.assertNotIn("qemu-xhci,id=xhci", args)
+
+    def test_xhci_exactly_once_with_remote_and_stick(self):
+        args = vmctl.qemu_args(Path("disk.qcow2"), usb_image="usb.img", remote=True)
+        self.assertEqual(args.count("qemu-xhci,id=xhci"), 1)
+
+    def test_xhci_absent_with_neither(self):
+        args = vmctl.qemu_args(Path("disk.qcow2"), remote=False, usb_image=None)
+        self.assertNotIn("qemu-xhci,id=xhci", args)
+
+    def test_run_parser_remote_default_and_no_remote(self):
+        parser = vmctl._build_parser()
+        self.assertTrue(parser.parse_args(["run"]).remote)
+        self.assertFalse(parser.parse_args(["run", "--no-remote"]).remote)
+        self.assertTrue(parser.parse_args(["run", "--remote"]).remote)
+
+
+class UsbQmpTest(unittest.TestCase):
+    """usb unplug/plug + QMP event handling, over a mocked QMP socket."""
+
+    GREETING = b'{"QMP": {"version": {"qemu": {"micro": 0, "minor": 2, "major": 8}}, "capabilities": ["oob"]}}\n'
+    ACK = b'{"return": {}}\n'
+
+    def _mock_qmp_socket(self, messages: list[bytes]):
+        """Build a mock socket whose recv() feeds one byte at a time."""
+        sock = mock.Mock()
+        stream = b"".join(messages)
+        pos = 0
+
+        def recv(n: int) -> bytes:
+            nonlocal pos
+            chunk = stream[pos:pos + n]
+            pos += n
+            return chunk
+
+        sock.recv.side_effect = recv
+        return sock
+
+    def test_qmp_exchange_skips_interleaved_event(self):
+        """Async event lines interleaved before the reply are skipped."""
+        event = b'{"event": "file-loaded", "data": {}}\n'
+        ack = b'{"return": {"ok": 1}}\n'
+        sock = self._mock_qmp_socket([event, event, ack])
+        result = vmctl._qmp_exchange(sock, "get_property", {"name": "x"})
+        self.assertEqual(result, {"ok": 1})
+
+    def test_usb_unplug_sends_device_del_and_waits_for_event(self):
+        deleted = b'{"event": "DEVICE_DELETED", "data": {"device-id": "usbstick0"}}\n'
+        # greeting, ack(caps), ack(device_del), then the DEVICE_DELETED event.
+        sock = self._mock_qmp_socket([self.GREETING, self.ACK, self.ACK, deleted])
+        monitor = str(Path(tempfile.gettempdir()) / "qmp.sock")
+        with mock.patch.object(vmctl.socket, "socket", return_value=sock):
+            rc = vmctl.cmd_usb(SimpleNamespace(action="unplug", monitor=monitor))
+        self.assertEqual(rc, 0)
+        sent = [json.loads(c.args[0].decode()) for c in sock.sendall.call_args_list]
+        self.assertEqual(sent[0]["execute"], "qmp_capabilities")
+        self.assertEqual(sent[1]["execute"], "device_del")
+        self.assertEqual(sent[1]["arguments"], {"id": "usbstick0"})
+
+    def test_usb_plug_sends_device_add(self):
+        # greeting, ack(caps), ack(device_add).
+        sock = self._mock_qmp_socket([self.GREETING, self.ACK, self.ACK])
+        monitor = str(Path(tempfile.gettempdir()) / "qmp.sock")
+        with mock.patch.object(vmctl.socket, "socket", return_value=sock):
+            rc = vmctl.cmd_usb(SimpleNamespace(action="plug", monitor=monitor))
+        self.assertEqual(rc, 0)
+        sent = [json.loads(c.args[0].decode()) for c in sock.sendall.call_args_list]
+        self.assertEqual(sent[1]["execute"], "device_add")
+        self.assertEqual(sent[1]["arguments"], {
+            "driver": "usb-storage",
+            "bus": "xhci.0",
+            "drive": "usbstick",
+            "id": "usbstick0",
+            "removable": True,
+        })
+
+
+class RemoteQmpTest(unittest.TestCase):
+    """vmctl key / remote / powerbutton over a mocked QMP socket."""
+
+    GREETING = b'{"QMP": {"version": {"qemu": {"micro": 0, "minor": 2, "major": 8}}, "capabilities": ["oob"]}}\n'
+    ACK = b'{"return": {}}\n'
+
+    def _mock_sock(self, messages: list[bytes]):
+        sock = mock.Mock()
+        stream = b"".join(messages)
+        pos = 0
+
+        def recv(n: int) -> bytes:
+            nonlocal pos
+            chunk = stream[pos:pos + n]
+            pos += n
+            return chunk
+
+        sock.recv.side_effect = recv
+        return sock
+
+    def test_key_sends_down_then_up(self):
+        sock = self._mock_sock([self.GREETING, self.ACK, self.ACK, self.ACK])
+        monitor = str(Path(tempfile.gettempdir()) / "qmp.sock")
+        with mock.patch.object(vmctl.socket, "socket", return_value=sock):
+            rc = vmctl.cmd_key(SimpleNamespace(button="up", hold=0.1, monitor=monitor))
+        self.assertEqual(rc, 0)
+        sent = [json.loads(c.args[0].decode()) for c in sock.sendall.call_args_list]
+        self.assertEqual(sent[0]["execute"], "qmp_capabilities")
+        down = sent[1]["arguments"]["events"][0]
+        self.assertEqual(down, {
+            "type": "key",
+            "data": {"key": {"type": "qcode", "data": "up"}, "down": True},
+        })
+        up = sent[2]["arguments"]["events"][0]
+        self.assertEqual(up["data"]["key"]["data"], "up")
+        self.assertFalse(up["data"]["down"])
+
+    def test_key_hold_is_honoured(self):
+        sock = self._mock_sock([self.GREETING, self.ACK, self.ACK, self.ACK])
+        monitor = str(Path(tempfile.gettempdir()) / "qmp.sock")
+        with mock.patch.object(vmctl.socket, "socket", return_value=sock), \
+                mock.patch.object(vmctl.time, "sleep") as slp:
+            rc = vmctl.cmd_key(SimpleNamespace(button="down", hold=2.0, monitor=monitor))
+        self.assertEqual(rc, 0)
+        slp.assert_called_once_with(2.0)
+
+    def test_key_unknown_button_exits_2(self):
+        rc = vmctl.cmd_key(SimpleNamespace(button="bogus", hold=0.1, monitor="x"))
+        self.assertEqual(rc, 2)
+
+    def test_remote_unplug_waits_for_device_deleted(self):
+        deleted = b'{"event": "DEVICE_DELETED", "data": {"device-id": "remote0"}}\n'
+        sock = self._mock_sock([self.GREETING, self.ACK, self.ACK, deleted])
+        monitor = str(Path(tempfile.gettempdir()) / "qmp.sock")
+        with mock.patch.object(vmctl.socket, "socket", return_value=sock):
+            rc = vmctl.cmd_remote(SimpleNamespace(action="unplug", monitor=monitor))
+        self.assertEqual(rc, 0)
+        sent = [json.loads(c.args[0].decode()) for c in sock.sendall.call_args_list]
+        self.assertEqual(sent[1]["execute"], "device_del")
+        self.assertEqual(sent[1]["arguments"], {"id": "remote0"})
+
+    def test_remote_plug_sends_device_add(self):
+        sock = self._mock_sock([self.GREETING, self.ACK, self.ACK])
+        monitor = str(Path(tempfile.gettempdir()) / "qmp.sock")
+        with mock.patch.object(vmctl.socket, "socket", return_value=sock):
+            rc = vmctl.cmd_remote(SimpleNamespace(action="plug", monitor=monitor))
+        self.assertEqual(rc, 0)
+        sent = [json.loads(c.args[0].decode()) for c in sock.sendall.call_args_list]
+        self.assertEqual(sent[1]["execute"], "device_add")
+        self.assertEqual(sent[1]["arguments"], {"driver": "usb-kbd", "bus": "xhci.0", "id": "remote0"})
+
+    def test_powerbutton_sends_system_powerdown(self):
+        sock = self._mock_sock([self.GREETING, self.ACK, self.ACK])
+        monitor = str(Path(tempfile.gettempdir()) / "qmp.sock")
+        with mock.patch.object(vmctl.socket, "socket", return_value=sock):
+            rc = vmctl.cmd_powerbutton(SimpleNamespace(monitor=monitor))
+        self.assertEqual(rc, 0)
+        sent = [json.loads(c.args[0].decode()) for c in sock.sendall.call_args_list]
+        self.assertEqual(sent[1]["execute"], "system_powerdown")
 
 
 if __name__ == "__main__":

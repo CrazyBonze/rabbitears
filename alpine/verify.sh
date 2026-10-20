@@ -87,6 +87,8 @@ fi
 log "Checking for target drift ..."
 while IFS=$'\t' read -r sha target_path repo_rel; do
   [ -n "$sha" ] || continue
+  # Managed blocks are not whole files; they are checked in section 2b.
+  case "$target_path" in *::block::*) continue ;; esac
   actual_sha="$(ssh_cmd "sha256sum '$target_path' 2>/dev/null | cut -d' ' -f1" || true)"
   if [ -z "$actual_sha" ]; then
     finding "DRIFT ${target_path}: file missing on the target since the last deploy. Redeploy."
@@ -107,6 +109,39 @@ while IFS=$'\t' read -r sha target_path repo_rel; do
   local_sha="$(sha256sum "$local_src" | cut -d' ' -f1)"
   if [ "$local_sha" != "$sha" ]; then
     finding "STALE ${target_path}: the repo changed since the last deploy. Redeploy (uv run task deploy-vm / deploy-box)."
+  fi
+done <<< "$MANIFEST"
+
+# --- 2b. Managed blocks: extract from the target and check missing/dup/edited.
+#      (STALE for a block is already covered by section 2, which compares the
+#       recorded snippet hash against the current repo snippet.) ---
+log "Checking managed blocks ..."
+while IFS=$'\t' read -r sha target_path repo_rel; do
+  [ -n "$sha" ] || continue
+  case "$target_path" in
+    *::block::*) ;;
+    *) continue ;;
+  esac
+  file="${target_path%%::block::*}"
+  name="${target_path##*::block::}"
+  # Count BEGIN-line occurrences (detect missing / duplicated).
+  count="$(ssh_cmd "grep -c '^# BEGIN ${name}' '$file' 2>/dev/null" || true)"
+  if [ -z "$count" ] || [ "$count" = "0" ]; then
+    finding "DRIFT ${file} block '${name}': missing on the target. Redeploy."
+    continue
+  fi
+  if [ "$count" -gt 1 ]; then
+    finding "DRIFT ${file} block '${name}': appears ${count} times (should be 1). Redeploy."
+  fi
+  # Extract the block (BEGIN..END inclusive) and compare to the repo snippet.
+  block="$(ssh_cmd "awk -v b='# BEGIN ${name}' -v e='# END ${name}' 'index(\$0,b)==1{s=1} s{print} index(\$0,e)==1{s=0}' '$file' 2>/dev/null" || true)"
+  snippet="${REPO_ROOT}/${repo_rel}"
+  if [ ! -f "$snippet" ]; then
+    finding "STALE ${file} block '${name}': repo snippet ${repo_rel} no longer exists. Redeploy."
+    continue
+  fi
+  if [ "$block" != "$(cat "$snippet")" ]; then
+    finding "DRIFT ${file} block '${name}': edited on the target since the last deploy. Fix the repo and redeploy."
   fi
 done <<< "$MANIFEST"
 
@@ -138,16 +173,19 @@ if [ -f "$PKGS_FILE" ]; then
   done <<< "$PKGS"
 fi
 
-# --- 5. Services: sshd, chronyd, rabbitears in default runlevel; rabbitears started ---
+# --- 5. Services: sshd, chronyd, rabbitears, rabbitears-remote, acpid in the
+#    default runlevel; rabbitears/rabbitears-remote/acpid started ---
 log "Checking services ..."
-for svc in sshd chronyd rabbitears; do
+for svc in sshd chronyd rabbitears rabbitears-remote acpid; do
   if ! ssh_cmd "rc-status default 2>/dev/null | grep -q ' ${svc} '"; then
     finding "SERVICE ${svc}: not in the default runlevel."
   fi
 done
-if ! ssh_cmd "rc-service rabbitears status 2>&1" | grep -q "started"; then
-  finding "SERVICE rabbitears: not started."
-fi
+for svc in rabbitears rabbitears-remote acpid; do
+  if ! ssh_cmd "rc-service ${svc} status 2>&1" | grep -q "started"; then
+    finding "SERVICE ${svc}: not started."
+  fi
+done
 
 # --- 6. lbu: each include path appears exactly once ---
 # Normalise: lbu include -l may strip the leading /, so compare

@@ -29,14 +29,27 @@ serial console, and leaves the disk at rest (domain shut off):
 What it does (idempotent, safe to re-run):
 
 1. Installs host packages (qemu, libvirt, `python3-paramiko`, `python3-serial`).
-2. Downloads + SHA256-verifies the pinned Alpine ISO (`vm/isos/`, git-ignored).
-3. Generates the VM SSH keypair (`vm/keys/`, git-ignored) and syncs the
-   answerfile's `ROOTSSHKEY` to it — so a fresh clone always matches.
+2. Downloads + SHA256-verifies the pinned Alpine ISO (`/var/lib/rabbitears-vm/isos/`).
+3. Generates the VM SSH keypair (`vm/keys/`, git-ignored).
 4. Creates the 8 GB disk and defines the domain (direct kernel boot + serial pty).
-5. Logs into the live system over serial, writes `alpine/answerfile`, and runs
-   `setup-alpine -f` unattended: empty root password, auto-confirmed disk erase
-   (`ERASE_DISKS`), and the SSH key baked in for passwordless root.
-6. Switches the domain to boot from disk and verifies SSH with the key.
+   Refuses if any QEMU already holds the disk, or if the answerfile's apk repos
+   don't answer.
+5. Logs into the live system over serial, sends `alpine/answerfile` with this
+   clone's public key injected as `ROOTSSHKEY` (the repo file holds a
+   placeholder and is never rewritten), checks its sha256, and runs
+   `setup-alpine -e -f` unattended: empty root password, auto-confirmed disk
+   erase (`ERASE_DISKS`), and the SSH key baked in for passwordless root.
+   Every serial byte goes to `/var/lib/rabbitears-vm/install-serial.log`. The
+   install fails fast if setup-alpine asks a question, a section stalls, or
+   the disk doesn't grow (see `vm/VAGRANT.md`, "When `vm-build` fails").
+6. Powers the live system off, switches the domain to boot from disk, checks
+   over SSH that it's the installed system (hostname, disk-backed root), then
+   powers it off so the disk is left at rest.
+
+> **The answerfile must answer everything.** setup-alpine prompts for any
+> unset `*OPTS` variable, and nobody is there to answer on the serial
+> console. `tests/test_install.py` sources `alpine/answerfile` and fails if a
+> required option is missing.
 
 > **Speed:** the VM's e1000+NAT path to the public CDN is slow (~50 KB/s), while
 > the host pulls the CDN at several MB/s. Start the local caching proxy first so

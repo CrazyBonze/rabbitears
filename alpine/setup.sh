@@ -74,6 +74,56 @@ install_file() {
   manifest_entry "$_sha" "$_dest" "$_repo_rel"
 }
 
+# replace_managed_block FILE NAME SRC_FILE {top|bottom}
+# Deletes any existing "# BEGIN NAME" ... "# END NAME" block in FILE and inserts
+# the content of SRC_FILE fresh (at the top or bottom). Writes atomically, and
+# only when the result differs, incrementing CHANGED. Using replace (not
+# append-once) means repo changes to the snippet reach the target on every
+# deploy; a `grep -q || append` would freeze the first version forever.
+replace_managed_block() {
+  _file="$1" _name="$2" _src="$3" _where="$4"
+  _begin="# BEGIN ${_name}"
+  _end="# END ${_name}"
+
+  _cur=""
+  [ -f "$_file" ] && _cur="$(cat "$_file")"
+
+  # Strip every existing managed block (match by line prefix, so the trailing
+  # "(managed by ...)" comment on the BEGIN line doesn't matter).
+  _stripped="$(printf '%s\n' "$_cur" | awk -v b="$_begin" -v e="$_end" '
+    index($0, b) == 1 { skip = 1; next }
+    index($0, e) == 1 { skip = 0; next }
+    !skip { print }
+  ')"
+
+  _block="$(cat "$_src")"
+  # Record the snippet's hash in the manifest so verify.sh can tell a STALE
+  # deploy (repo snippet changed since last deploy) apart from target DRIFT
+  # (block edited on the target). The pseudo-path <file>::block::<name> marks
+  # it as a managed block, not a whole file.
+  _snippet_sha="$(sha256sum "$_src" | cut -d' ' -f1)"
+  manifest_entry "$_snippet_sha" "${_file}::block::${_name}" "${_src#"$REPO_ROOT"/}"
+  if [ -n "$_stripped" ]; then
+    if [ "$_where" = "top" ]; then
+      _new="$(printf '%s\n%s\n' "$_block" "$_stripped")"
+    else
+      _new="$(printf '%s\n%s\n' "$_stripped" "$_block")"
+    fi
+  else
+    _new="$(printf '%s\n' "$_block")"
+  fi
+
+  _tmp="$(mktemp "$(dirname "$_file")/.${_name}.XXXXXX")"
+  printf '%s\n' "$_new" > "$_tmp"
+  if [ -f "$_file" ] && cmp -s "$_tmp" "$_file"; then
+    rm -f "$_tmp"
+    return 0
+  fi
+  mv "$_tmp" "$_file"
+  CHANGED=$((CHANGED + 1))
+  log "managed block '${_name}' updated in $_file"
+}
+
 # ---------------------------------------------------------------------------
 # 1. Install packages (from the authoritative list).
 # ---------------------------------------------------------------------------
@@ -103,9 +153,33 @@ install -d -m 0755 /etc/rabbitears
 log "Installing system/ config ..."
 install_file "${REPO_ROOT}/system/mpv/mpv.conf" /etc/mpv/mpv.conf 0644
 install_file "${REPO_ROOT}/system/openrc/rabbitears" /etc/init.d/rabbitears 0755
+# The evdev remote daemon service (writes button lines to the FIFO; SCOPE §4.4).
+install_file "${REPO_ROOT}/system/openrc/rabbitears-remote" /etc/init.d/rabbitears-remote 0755
+# The mdev hotplug handler (mounts the RABBITEARS drive by label; SCOPE §4.8).
+# Lives under /etc so lbu persists it; verify.sh covers it via the manifest.
+install_file "${REPO_ROOT}/system/mdev/rabbitears-usb" /etc/rabbitears/mdev-usb 0755
 
-# TODO: system/acpid/       — power-button override (KEY_POWER -> standby, not off).
-# TODO: system/fstab.snippet — LABEL=RABBITEARS exFAT mount at /media/rabbitears.
+# The acpid power-button hooks (busybox acpid, inbuilt on Alpine): the remote's
+# ungrabbed KEY_POWER (PWRF) and the physical/ACPI button (PWRB) both become a
+# logged no-op, never a shutdown (SCOPE §3). Under /etc so lbu persists them.
+install_file "${REPO_ROOT}/system/acpid/PWRF/00000080" /etc/acpi/PWRF/00000080 0755
+install_file "${REPO_ROOT}/system/acpid/PWRB/00000080" /etc/acpi/PWRB/00000080 0755
+
+# The /etc/mdev.conf managed block: routes /dev/sd* to the handler. Replaced
+# fresh on every deploy (not append-once) so repo changes reach the target.
+replace_managed_block /etc/mdev.conf rabbitears "${REPO_ROOT}/system/mdev/mdev.conf.snippet" top
+
+# Coldplug: the stick may already be enumerated before the rule fires at boot.
+# Run the handler for every /dev/sd* node so a first deploy mounts an
+# already-attached stick without a reboot. (The reboot in validation is the
+# real test; this just avoids a manual step on the first deploy.)
+log "Running mdev coldplug ..."
+for _dev in /dev/sd*; do
+  [ -e "$_dev" ] || continue
+  _name="$(basename "$_dev")"
+  MDEV="$_name" ACTION=add /etc/rabbitears/mdev-usb
+done
+
 # TODO: system/fonts/       — bundled pixel font + license (replaces font-terminus).
 
 # ---------------------------------------------------------------------------
@@ -170,6 +244,9 @@ fi
 # ---------------------------------------------------------------------------
 log "Installing test pattern ..."
 install_file "${REPO_ROOT}/tools/testpattern.png" /usr/share/rabbitears/testpattern.png 0644
+# The e2e remote test double (writes button lines to the FIFO; the VM has no
+# physical remote). Harmless on the box, where the evdev daemon is the writer.
+install_file "${REPO_ROOT}/tools/e2e-remote.py" /usr/share/rabbitears/e2e-remote.py 0755
 
 # ---------------------------------------------------------------------------
 # 6. Register OpenRC services.
@@ -178,7 +255,12 @@ log "Registering services ..."
 rc-update add sshd default        2>/dev/null || true
 rc-update add chronyd default     2>/dev/null || true
 rc-update add rabbitears default  2>/dev/null || true
-# TODO: acpid — enable once the power-button override is in place.
+rc-update add rabbitears-remote default  2>/dev/null || true
+# mdev runs in sysinit so the hotplug rule is live before the drive appears.
+rc-update add mdev sysinit        2>/dev/null || true
+# busybox acpid (inbuilt): the power-button hooks above make KEY_POWER and the
+# ACPI button a logged no-op (SCOPE §3), so it's safe to enable.
+rc-update add acpid default       2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 7. lbu: include managed paths (idempotent).

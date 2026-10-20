@@ -1,0 +1,8 @@
+#!/bin/sh
+# Rabbit Ears — power-button override (SCOPE §3).
+#
+# busybox acpid runs this via run-parts for a "button/power PWRF" event, i.e.
+# the remote's KEY_POWER when it reaches the kernel ungrabbed (at boot, or
+# during the app's respawn window). The app handles that key as standby; at the
+# OS level it must never shut the box down. This is a logged no-op.
+logger -t rabbitears-power "power button (PWRF) ignored (SCOPE §3)"

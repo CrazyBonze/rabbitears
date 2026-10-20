@@ -6,11 +6,18 @@
 # Alpine release + SHA256 so the VM is always built from the same inputs.
 #
 # Usage (self-elevates under the NOPASSWD rule from vm/setup-sudoers.sh):
-#   ./vm/provision.sh            # create (if needed) + install the base OS
+#   ./vm/provision.sh [--keep-on-failure]
+#                                # create (if needed) + install the base OS;
+#                                # --keep-on-failure leaves a failed live VM up
+#                                # for `virsh -c qemu:///system console rabbitears-vm`
 #   ./vm/provision.sh status     # show VM / ISO / disk status
-#   ./vm/provision.sh stop       # shut the domain down (idempotent)
+#   ./vm/provision.sh stop       # shut the domain down + verify its QEMU is gone
 #   ./vm/provision.sh eject      # detach the ISO so the VM boots from disk
-#   ./vm/provision.sh destroy    # delete the VM + its disk (keeps the ISO)
+#   ./vm/provision.sh destroy    # delete the VM + its disk (keeps the ISO);
+#                                # refuses while a vmctl QEMU holds the disk
+#
+# The install's serial transcript is written to
+# /var/lib/rabbitears-vm/install-serial.log (readable without sudo).
 #
 set -euo pipefail
 
@@ -38,7 +45,6 @@ VM_BASE="/var/lib/rabbitears-vm"
 ISO_PATH="${VM_BASE}/isos/${ALPINE_ISO}"
 BOOT_DIR="${VM_BASE}/boot"                 # kernel + initrd extracted from the ISO
 DISK_PATH="/var/lib/libvirt/images/${VM_NAME}.qcow2"
-SERIAL_PORT="${RB_SERIAL_PORT:-5555}"      # TCP serial the installer attaches to
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RAM_KIB=$((VM_RAM_MB * 1024))
 
@@ -54,7 +60,104 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 REAL_USER="${SUDO_USER:-root}"
 
-cmd="${1:-create}"
+# `./vm/provision.sh [--keep-on-failure]` means `create [--keep-on-failure]`.
+case "${1:-}" in
+  ""|--*) cmd="create" ;;
+  *)      cmd="$1"; shift ;;
+esac
+KEEP_ON_FAILURE=0
+if [ "$cmd" = "create" ]; then
+  for _a in "$@"; do
+    case "$_a" in
+      --keep-on-failure) KEEP_ON_FAILURE=1 ;;
+      *) die "unknown option for create: $_a (use --keep-on-failure)" ;;
+    esac
+  done
+fi
+INSTALL_LOG="${VM_BASE}/install-serial.log"
+PROXY_LOG="/var/log/rabbitears-apk-proxy.log"
+
+# ---------------------------------------------------------------------------
+# Process helpers. Never `pkill -f` a pattern that might also appear in a
+# caller's command line (it kills the caller); match the libvirt QEMU by its
+# exact `-name guest=<vm>,` argument and the disk holders with fuser.
+# ---------------------------------------------------------------------------
+libvirt_qemu_pids() { pgrep -f "guest=${VM_NAME}," 2>/dev/null || true; }
+
+# PIDs of every process that has the VM disk open (libvirt's or vmctl's QEMU).
+disk_holders() {
+  [ -e "$DISK_PATH" ] || return 0
+  fuser "$DISK_PATH" 2>/dev/null | tr -s ' \t' '\n' | grep -E '^[0-9]+$' || true
+}
+
+describe_pids() {
+  local p
+  for p in "$@"; do
+    ps -o pid=,user=,args= -p "$p" 2>/dev/null | cut -c1-200 || true
+  done
+}
+
+# Stop the libvirt domain and make sure its QEMU process is really gone.
+ensure_domain_stopped() {
+  local p
+  virsh destroy "$VM_NAME" >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    [ -z "$(libvirt_qemu_pids)" ] && return 0
+    sleep 0.5
+  done
+  warn "libvirt QEMU for ${VM_NAME} survived 'virsh destroy'; killing it."
+  for p in $(libvirt_qemu_pids); do kill -TERM "$p" 2>/dev/null || true; done
+  sleep 3
+  for p in $(libvirt_qemu_pids); do kill -KILL "$p" 2>/dev/null || true; done
+  sleep 1
+  if [ -n "$(libvirt_qemu_pids)" ]; then
+    # shellcheck disable=SC2046
+    die "libvirt QEMU for ${VM_NAME} won't die:
+$(describe_pids $(libvirt_qemu_pids))"
+  fi
+}
+
+# Refuse to touch the disk while any process (e.g. a `vm-run` QEMU) holds it.
+require_disk_free() {
+  local pids
+  pids="$(disk_holders | tr '\n' ' ')"
+  [ -z "${pids// /}" ] && return 0
+  # shellcheck disable=SC2086
+  die "the VM disk ${DISK_PATH} is in use by:
+$(describe_pids $pids)
+Stop it first: uv run task vm-stop  (stops vmctl's QEMU and the libvirt domain)."
+}
+
+start_proxy() {
+  if pgrep -f "vm/apk-proxy.py" >/dev/null 2>&1; then
+    log "apk-proxy already running (pid $(pgrep -f 'vm/apk-proxy.py' | head -1))."
+  else
+    nohup python3 "${REPO_ROOT}/vm/apk-proxy.py" > "$PROXY_LOG" 2>&1 &
+    log "apk-proxy started (pid $!) on 192.168.122.1:8081; log: ${PROXY_LOG}."
+  fi
+}
+
+# The install's "APK Mirror" step and every package install need the repos in
+# the answerfile to answer. Check them from the host before booting anything.
+check_apk_repos() {
+  local answerfile="${REPO_ROOT}/alpine/answerfile" repos url ok
+  repos="$(sed -n 's/^APKREPOSOPTS="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$answerfile" | head -1)"
+  [ -n "$repos" ] || die "no APKREPOSOPTS in ${answerfile}"
+  case "$repos" in *192.168.122.1:8081*) start_proxy ;; esac
+  for url in $repos; do
+    case "$url" in http://*|https://*) ;; *) continue ;; esac
+    ok=0
+    for _ in $(seq 1 10); do
+      if curl -fsS -o /dev/null --max-time 60 "${url}/x86_64/APKINDEX.tar.gz" 2>/dev/null; then
+        ok=1; break
+      fi
+      sleep 1
+    done
+    [ "$ok" -eq 1 ] || die "apk repo ${url} does not answer (${url}/x86_64/APKINDEX.tar.gz).
+The install would fail at its 'APK Mirror' step. Check the proxy: uv run task vm-proxy (log: ${PROXY_LOG})."
+  done
+  log "apk repos answer: ${repos}"
+}
 
 # ---------------------------------------------------------------------------
 # status
@@ -64,10 +167,19 @@ if [ "$cmd" = "status" ]; then
   echo
   echo "ISO:  ${ISO_PATH} $([ -f "$ISO_PATH" ] && echo '(present)' || echo '(missing)')"
   if virsh list --all --name 2>/dev/null | grep -qx "$VM_NAME"; then
-    echo "Disk: $(virsh domblklist "$VM_NAME" 2>/dev/null | awk 'NR>1 && $2!="" {print $4}')"
+    echo "Disk: $(virsh domblklist "$VM_NAME" 2>/dev/null | awk 'NR>2 && $2!="" && $2!="-" {print $2}' | head -1)"
   else
     echo "Disk: (no VM)"
   fi
+  _holders="$(disk_holders | tr '\n' ' ')"
+  if [ -n "${_holders// /}" ]; then
+    echo "Disk in use by:"
+    # shellcheck disable=SC2086
+    describe_pids $_holders | sed 's/^/  /'
+  else
+    echo "Disk in use by: (nothing)"
+  fi
+  echo "Install transcript: ${INSTALL_LOG} $([ -f "$INSTALL_LOG" ] && echo '(present)' || echo '(none yet)')"
   exit 0
 fi
 
@@ -119,8 +231,8 @@ fi
 # diskboot — switch the VM to boot from disk (the installed system) + start it
 # ---------------------------------------------------------------------------
 if [ "$cmd" = "diskboot" ]; then
-  pkill -f "guest=${VM_NAME}" 2>/dev/null || true
-  sleep 1
+  ensure_domain_stopped
+  require_disk_free
   virsh undefine "$VM_NAME" 2>/dev/null || true
   cat > "/tmp/${VM_NAME}-diskboot.xml" <<XML
 <domain type='kvm'>
@@ -176,8 +288,8 @@ fi
 # liveboot — boot the live ISO (kernel boot) for debugging the installed disk
 # ---------------------------------------------------------------------------
 if [ "$cmd" = "liveboot" ]; then
-  pkill -f "guest=${VM_NAME}" 2>/dev/null || true
-  sleep 1
+  ensure_domain_stopped
+  require_disk_free
   virsh undefine "$VM_NAME" 2>/dev/null || true
   cat > "/tmp/${VM_NAME}-live.xml" <<XML
 <domain type='kvm'>
@@ -235,12 +347,7 @@ fi
 # proxy — start the local Alpine CDN caching proxy (background, as root)
 # ---------------------------------------------------------------------------
 if [ "$cmd" = "proxy" ]; then
-  if pgrep -f "apk-proxy.py" >/dev/null 2>&1; then
-    log "apk-proxy already running (pid $(pgrep -f 'apk-proxy.py' | head -1))."
-  else
-    nohup python3 "${REPO_ROOT}/vm/apk-proxy.py" > /var/log/rabbitears-apk-proxy.log 2>&1 &
-    log "apk-proxy started (pid $!) on 192.168.122.1:8081; log: /var/log/rabbitears-apk-proxy.log."
-  fi
+  start_proxy
   exit 0
 fi
 
@@ -248,18 +355,22 @@ fi
 # destroy
 # ---------------------------------------------------------------------------
 if [ "$cmd" = "destroy" ]; then
+  ensure_domain_stopped
+  # A vmctl QEMU (uv run task vm-run) may still hold the disk: refuse rather
+  # than delete a disk that a running VM is using.
+  require_disk_free
   if virsh list --all --name 2>/dev/null | grep -qx "$VM_NAME"; then
     log "Destroying VM '$VM_NAME' (and its disk)..."
-    virsh destroy "$VM_NAME" 2>/dev/null || true
     virsh undefine "$VM_NAME" --nvram --delete-all-disks 2>/dev/null \
       || virsh undefine "$VM_NAME" --delete-all-disks 2>/dev/null \
       || virsh undefine "$VM_NAME"
   else
     log "VM '$VM_NAME' not found; nothing to destroy."
   fi
-  pkill -f "guest=${VM_NAME}" 2>/dev/null || true
   rm -f "$DISK_PATH" 2>/dev/null || true
-  log "Done. (ISO kept at ${ISO_PATH})"
+  # media/ (transcoded content) and usb.img (the mock stick) are content, not
+  # VM state — keep them so a rebuild doesn't force a re-transcode.
+  log "Done. (ISO kept at ${ISO_PATH}; ${VM_BASE}/media and usb.img kept)"
   exit 0
 fi
 
@@ -282,26 +393,24 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$cmd" = "stop" ]; then
   state="$(virsh domstate "$VM_NAME" 2>/dev/null || true)"
-  if [ -z "$state" ] || [ "$state" = "error" ] || printf '%s' "$state" | grep -qi "not found"; then
-    log "VM '${VM_NAME}' is not defined; nothing to stop."
-    exit 0
+  if [ "$state" = "running" ] || [ "$state" = "paused" ]; then
+    log "Shutting down VM '${VM_NAME}'..."
+    virsh shutdown "$VM_NAME" 2>/dev/null || true
+    for _ in $(seq 1 60); do
+      state="$(virsh domstate "$VM_NAME" 2>/dev/null || true)"
+      [ "$state" = "shut off" ] && break
+      sleep 1
+    done
+    [ "$state" = "shut off" ] || log "Graceful shutdown timed out; forcing destroy."
+  elif [ -z "$state" ]; then
+    log "VM '${VM_NAME}' is not defined."
+  else
+    log "VM '${VM_NAME}' is ${state}."
   fi
-  if [ "$state" = "shut off" ]; then
-    log "VM '${VM_NAME}' is already shut off."
-    exit 0
-  fi
-  log "Shutting down VM '${VM_NAME}'..."
-  virsh shutdown "$VM_NAME" 2>/dev/null || true
-  for _ in $(seq 1 60); do
-    state="$(virsh domstate "$VM_NAME" 2>/dev/null || true)"
-    [ "$state" = "shut off" ] && break
-    sleep 1
-  done
-  if [ "$state" != "shut off" ]; then
-    log "Graceful shutdown timed out; forcing destroy."
-    virsh destroy "$VM_NAME" 2>/dev/null || true
-  fi
-  log "VM '${VM_NAME}' is shut off."
+  # Whatever libvirt says, make sure no QEMU for this domain survives
+  # (an orphan from an aborted install keeps the disk locked).
+  ensure_domain_stopped
+  log "VM '${VM_NAME}' is shut off; no libvirt QEMU left for it."
   exit 0
 fi
 
@@ -379,27 +488,21 @@ if [ ! -f "$BOOT_DIR/vmlinuz-lts" ] || [ ! -f "$BOOT_DIR/initramfs-lts" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4b. SSH keypair (passwordless root access; idempotent) + sync the answerfile
-#     The private key is git-ignored; on a fresh clone it's regenerated here and
-#     the answerfile's ROOTSSHKEY is updated to match, so the install always works.
+# 4b. SSH keypair (passwordless root access; idempotent)
+#     The keypair is git-ignored; on a fresh clone it's generated here. The
+#     repo's answerfile is never rewritten: install.py injects the public key
+#     into the copy it sends to the VM.
+#     The files belong to the real user (this script runs as root), so
+#     deploy.sh/vmctl can read the key without sudo.
 # ---------------------------------------------------------------------------
 KEY_DIR="${REPO_ROOT}/vm/keys"
 KEY_PATH="${KEY_DIR}/rabbitears-vm"
-ANSWERFILE="${REPO_ROOT}/alpine/answerfile"
-install -d -m 0700 "$KEY_DIR"
+install -d -m 0700 -o "$REAL_USER" "$KEY_DIR"
 if [ ! -f "$KEY_PATH" ]; then
   log "Generating VM SSH keypair at vm/keys/rabbitears-vm ..."
   ssh-keygen -t ed25519 -N "" -C "rabbitears-vm" -f "$KEY_PATH" -q
   chmod 0600 "$KEY_PATH"
-fi
-if [ -f "$ANSWERFILE" ]; then
-  PUBKEY="$(cat "${KEY_PATH}.pub")"
-  _tmp="$(mktemp)"
-  if sed "s|^ROOTSSHKEY=.*|ROOTSSHKEY=\"${PUBKEY}\"|" "$ANSWERFILE" > "$_tmp"; then
-    mv "$_tmp" "$ANSWERFILE"
-  else
-    rm -f "$_tmp"
-  fi
+  chown "$REAL_USER" "$KEY_PATH" "${KEY_PATH}.pub"
 fi
 
 # ---------------------------------------------------------------------------
@@ -415,6 +518,14 @@ chown root:"$QEMU_GROUP" "$DISK_PATH"
 chmod 0660 "$DISK_PATH"
 
 # ---------------------------------------------------------------------------
+# 5b. Media staging dir (user-owned): holds the transcoded content that
+#     vm/make-usb.sh syncs onto the mock USB stick. Created BEFORE the
+#     "already installed" early-skip so a no-op re-run still ensures it.
+# ---------------------------------------------------------------------------
+install -d -m 0755 "${VM_BASE}/media/channels"
+chown "${REAL_USER}":"${REAL_USER}" "${VM_BASE}/media/channels"
+
+# ---------------------------------------------------------------------------
 # 6. Define the domain (direct kernel boot + pty serial), idempotent
 # ---------------------------------------------------------------------------
 # Check if the domain is already installed BEFORE killing anything.
@@ -425,10 +536,17 @@ if [ -n "$_xml" ] && ! printf '%s' "$_xml" | grep -q '<kernel>' && printf '%s' "
   exit 0
 fi
 
-# Kill any orphaned qemu process for this VM (from a crashed/aborted run).
-pkill -f "guest=${VM_NAME}" 2>/dev/null || true
+# Stop any orphaned libvirt QEMU for this VM (from a crashed/aborted run), then
+# refuse to go on while anything else (e.g. a `vm-run` QEMU) holds the disk:
+# two QEMUs on one qcow2 corrupt it.
+ensure_domain_stopped
+require_disk_free
+
+# The install fails (or hangs) at its APK Mirror step without working repos.
+check_apk_repos
+
 if ! virsh list --all --name 2>/dev/null | grep -qx "$VM_NAME"; then
-  log "Defining VM '$VM_NAME' (kernel boot, serial tcp 127.0.0.1:${SERIAL_PORT})..."
+  log "Defining VM '$VM_NAME' (kernel boot, serial pty)..."
   cat > "/tmp/${VM_NAME}.xml" <<XML
 <domain type='kvm'>
   <name>${VM_NAME}</name>
@@ -486,24 +604,31 @@ fi
 # ---------------------------------------------------------------------------
 # 7. Drive the zero-touch install (serial + paramiko); install.py starts the VM
 # ---------------------------------------------------------------------------
-log "Running the zero-touch install (serial console + paramiko)..."
-RB_VM_NAME="$VM_NAME" RB_SERIAL_PORT="$SERIAL_PORT" python3 "${REPO_ROOT}/vm/install.py"
+log "Running the zero-touch install (serial console + paramiko); transcript: ${INSTALL_LOG}"
+if ! RB_VM_NAME="$VM_NAME" RB_DISK_PATH="$DISK_PATH" RB_INSTALL_LOG="$INSTALL_LOG" \
+    RB_KEEP_VM="$KEEP_ON_FAILURE" python3 "${REPO_ROOT}/vm/install.py"; then
+  die "the zero-touch install failed (see above). Serial transcript: ${INSTALL_LOG}
+Retry with: uv run task vm-rebuild   (add --keep-on-failure to vm-build to leave the live VM up for: virsh -c qemu:///system console ${VM_NAME})"
+fi
 
 # ---------------------------------------------------------------------------
 # 8. Leave the disk at rest: shut the domain down so vmctl.py can open it.
 # ---------------------------------------------------------------------------
-log "Shutting down the domain (disk left at rest for vmctl.py)..."
-virsh shutdown "$VM_NAME" 2>/dev/null || true
-for _ in $(seq 1 60); do
-  state="$(virsh domstate "$VM_NAME" 2>/dev/null || true)"
-  [ "$state" = "shut off" ] && break
-  sleep 1
-done
+# install.py powers the installed system off over SSH; this is the fallback.
+state="$(virsh domstate "$VM_NAME" 2>/dev/null || true)"
 if [ "$state" != "shut off" ]; then
-  log "Graceful shutdown timed out; forcing destroy."
-  virsh destroy "$VM_NAME" 2>/dev/null || true
+  log "Shutting down the domain (disk left at rest for vmctl.py)..."
+  virsh shutdown "$VM_NAME" 2>/dev/null || true
+  for _ in $(seq 1 60); do
+    state="$(virsh domstate "$VM_NAME" 2>/dev/null || true)"
+    [ "$state" = "shut off" ] && break
+    sleep 1
+  done
+  [ "$state" = "shut off" ] || log "Graceful shutdown timed out; forcing destroy."
 fi
-log "Domain '${VM_NAME}' is shut off (still defined for console/liveboot)."
+ensure_domain_stopped
+require_disk_free
+log "Domain '${VM_NAME}' is shut off (still defined for console/liveboot); the disk is free."
 
 # ---------------------------------------------------------------------------
 # 9. Next steps

@@ -129,7 +129,7 @@ ship_repo() {
     --exclude='*.pyc' \
     -cf - \
     -C "$REPO_ROOT" \
-    alpine/ system/ src/ tools/testpattern.png \
+    alpine/ system/ src/ tools/testpattern.png tools/e2e-remote.py \
     | ssh_cmd "tar -xf - -C /tmp/rabbitears-repo"
   log "Repo shipped."
 }

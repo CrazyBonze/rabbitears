@@ -222,5 +222,6 @@ __marimo__/
 # Rabbit Ears — VM artifacts (large binaries, rebuilt by vm/provision.sh)
 vm/isos/
 vm/disks/
-# VM SSH keypair (private key is a secret; public key is in alpine/answerfile)
+# VM SSH keypair (private key is a secret; vm/install.py injects the public
+# key into the answerfile it sends to the VM)
 vm/keys/

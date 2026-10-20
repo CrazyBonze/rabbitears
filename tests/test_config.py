@@ -116,5 +116,58 @@ class LoadConfigTest(unittest.TestCase):
             self.assertEqual(cfg.testpattern_path, Path("/usr/share/rabbitears/testpattern.png"))
 
 
+class NewKeyDefaultsTest(unittest.TestCase):
+    def test_new_key_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = load_config(Path(tmp) / "nope" / "config.toml")
+            self.assertEqual(cfg.volume_step, 5)
+            self.assertEqual(cfg.repeat_delay, 0.5)
+            self.assertEqual(cfg.repeat_interval, 0.4)
+            self.assertEqual(cfg.remote_vendor, 0x0627)
+            self.assertEqual(cfg.control_socket, Path("/run/rabbitears/control.sock"))
+
+    def test_new_key_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                "volume_step = 3\n"
+                "repeat_delay = 1.0\n"
+                "repeat_interval = 0.2\n"
+                "remote_vendor = 4098\n"
+                'control_socket = "/tmp/ctl.sock"\n'
+            )
+            cfg = load_config(path)
+            self.assertEqual(cfg.volume_step, 3)
+            self.assertEqual(cfg.repeat_delay, 1.0)
+            self.assertEqual(cfg.repeat_interval, 0.2)
+            self.assertEqual(cfg.remote_vendor, 4098)
+            self.assertEqual(cfg.control_socket, Path("/tmp/ctl.sock"))
+
+    def test_volume_step_below_one_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("volume_step = 0\n")
+            self.assertEqual(load_config(path).volume_step, 5)
+
+    def test_repeat_interval_below_minimum_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("repeat_interval = 0.05\n")
+            self.assertEqual(load_config(path).repeat_interval, 0.4)
+
+    def test_invalid_types_fall_back_per_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                'volume_step = "loud"\n'      # invalid: string
+                "repeat_interval = 0.2\n"     # valid, preserved
+                'remote_vendor = "0627"\n'    # invalid: string
+            )
+            cfg = load_config(path)
+            self.assertEqual(cfg.volume_step, 5)
+            self.assertEqual(cfg.repeat_interval, 0.2)
+            self.assertEqual(cfg.remote_vendor, 0x0627)
+
+
 if __name__ == "__main__":
     unittest.main()
