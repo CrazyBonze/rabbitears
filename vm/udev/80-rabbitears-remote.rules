@@ -1,0 +1,12 @@
+# Rabbit Ears — grant the desktop user access to the Adomax remote dongle.
+#
+# The dongle (0627:697d) is a composite HID device (keyboard + system-control
+# interfaces). `vmctl.py run --remote-usb` passes it through with
+# `-device usb-host`, but QEMU runs as the unprivileged desktop user, and the
+# stock 50-udev-default.rules leaves every usb_device node as root:root 0664.
+# That user cannot open the node O_RDWR (EACCES), so QEMU's usb-host device
+# silently defers and the guest never sees the remote.
+#
+# Put the node in the plugdev group (the desktop user is a member) so QEMU can
+# claim it. Installed to /etc/udev/rules.d/ by vm/provision.sh.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0627", ATTR{idProduct}=="697d", GROUP="plugdev", MODE="0660"

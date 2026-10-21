@@ -52,6 +52,10 @@ transcode = { cmd = "tools/transcode.sh", help = "Transcode media to SCOPE §5 c
 media-check = { cmd = "tools/transcode.sh --check", help = "Check media files for SCOPE §5 compliance (append DIR)" }
 usb-build = { cmd = "./vm/make-usb.sh", help = "Build the mock USB stick image from the staging dir (append --reformat / --reset-state)" }
 vm-run-usb = { cmd = "python vm/vmctl.py run --usb /var/lib/rabbitears-vm/usb.img", help = "Boot the VM in QEMU with the mock USB stick attached" }
+vm-run-usb-spice = { cmd = "python vm/vmctl.py run --usb /var/lib/rabbitears-vm/usb.img --display spice", help = "Boot the VM with the stick + a live SPICE display (connect: spice://127.0.0.1:5910)" }
+vm-run-usb-vnc = { cmd = "python vm/vmctl.py run --usb /var/lib/rabbitears-vm/usb.img --display vnc", help = "Boot the VM with the stick + a live VNC display (connect: vnc://127.0.0.1:5901)" }
+vm-run-usb-vnc-remote = { cmd = "python vm/vmctl.py run --usb /var/lib/rabbitears-vm/usb.img --display vnc --remote-usb 0627:697d", help = "Boot the VM with the stick + VNC + the REAL Adomax dongle passed through (plug it in first)" }
+vm-watch = { cmd = "./vm/watch.sh", help = "Open the Remmina viewer on the running VM's VNC display (then drive it with the physical remote)" }
 usb-unplug = { cmd = "python vm/vmctl.py usb unplug", help = "Hot-unplug the mock USB stick from the running VM" }
 usb-plug = { cmd = "python vm/vmctl.py usb plug", help = "Re-insert the mock USB stick into the running VM" }
 vm-key = { cmd = "python vm/vmctl.py key", help = "Press a remote button in the VM (append BUTTON [--hold S]; e.g. up, volup, power, left)" }

@@ -232,6 +232,7 @@ rabbitears/
 │   ├── install.py            # drives setup-alpine over the serial console (transcript, watchdogs)
 │   ├── vmctl.py              # run the VM in raw QEMU (screenshot, usb + remote plug/unplug, key, powerbutton, stop)
 │   ├── e2e.py                # end-to-end pipeline check (vm-e2e)
+│   ├── udev/80-rabbitears-remote.rules  # host rule: dongle 0627:697d → plugdev (for --remote-usb passthrough)
 │   └── make-usb.sh           # build the mock USB stick image (exFAT, RABBITEARS)
 ├── alpine/
 │   ├── packages.txt          # one package per line; source of truth
@@ -378,6 +379,7 @@ Ideas we want eventually but will **not** start before v1.0:
 | 2026-10-20 | `e2e-remote` sends a press *and* a release (a tap) for every button | The app's `KeyRepeater` repeats a held channel key until its release arrives; a bare press repeats forever and re-tunes every 0.4 s, corrupting later e2e checks |
 | 2026-10-20 | Channel flash fires on *arrivals* only (initial tune, zap, standby wake), not same-channel rollovers (EOF / unplayable skip) | A `CH NN` pop at every episode boundary is the noise §9's "Up Next" cards were deferred to avoid; rollovers still refresh an open overlay's title/remaining |
 | 2026-10-20 | Bundled `VCR OSD Mono` is the OSD face (supersedes `font-dejavu`, which stays as the fallback) | A VCR/CRT-style monospace that matches the "cable box" look and scales at 72 px (unlike bitmap `font-terminus`); DejaVu covers glyphs VCR OSD Mono lacks |
+| 2026-10-21 | Real dongle passthrough via a provisioned udev rule (`plugdev`) + `vmctl.py run --remote-usb` | QEMU runs as the unprivileged desktop user and the stock USB node is `root:root 0664`, so `usb-host` silently defers; a repo-owned rule installed by `provision.sh` grants durable access without a hand-typed host edit |
 
 ## 11. Open questions
 - 8GB or 16GB eMMC on each unit? (Affects apk cache headroom.)

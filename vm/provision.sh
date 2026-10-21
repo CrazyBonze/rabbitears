@@ -435,6 +435,20 @@ else
   log "Host packages already present."
 fi
 
+# Grant the desktop user access to the Adomax remote dongle (udev rule), so an
+# unprivileged QEMU (vmctl.py run --remote-usb) can claim it via usb-host.
+# Without this the node is root:root 0664 (stock 50-udev-default.rules) and
+# QEMU silently defers the device — the guest never sees the remote. Scoped to
+# the one VID:PID; idempotent, re-applies to an already-plugged dongle.
+REMOTE_RULES_SRC="${REPO_ROOT}/vm/udev/80-rabbitears-remote.rules"
+REMOTE_RULES_DST="/etc/udev/rules.d/80-rabbitears-remote.rules"
+if ! cmp -s "$REMOTE_RULES_SRC" "$REMOTE_RULES_DST" 2>/dev/null; then
+  install -m 0644 "$REMOTE_RULES_SRC" "$REMOTE_RULES_DST"
+  udevadm control --reload-rules
+  udevadm trigger --subsystem-match=usb --attr-match=idVendor=0627 --attr-match=idProduct=697d 2>/dev/null || true
+  log "Installed udev rule for the remote dongle (0627:697d -> plugdev)."
+fi
+
 # Python deps for the zero-touch installer (idempotent).
 if ! python3 -c "import paramiko, serial" >/dev/null 2>&1; then
   log "Installing python3-paramiko + python3-serial..."

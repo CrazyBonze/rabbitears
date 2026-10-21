@@ -151,6 +151,29 @@ qemu-system-x86_64 \
 | `127.0.0.1:2222` | SSH, host-forwarded to the VM's `:22`. |
 | `/tmp/rabbitears-qmp.sock` | QMP monitor (Unix socket) for headless `screendump`. |
 
+### Live display (VNC) + real remote — sit in front of it
+
+To *use* the VM like the real box (see it live, drive it with the physical
+Adomax remote), boot with the VNC display and the dongle passed through:
+
+```sh
+uv run task vm-run-usb-vnc-remote   # stick + VNC (127.0.0.1:5901) + dongle
+uv run task vm-watch                # opens Remmina on the live screen (returns immediately)
+```
+
+`vm-watch` launches the repo's committed Remmina profile
+(`vm/remmina/rabbitears-vm.remmina`); any VNC client works too
+(`vinagre vnc://127.0.0.1:5901`). VNC mirrors the primary display surface that
+`screendump` captures, so it reliably shows mpv's DRM scanout (SPICE can show a
+multi-head view that hides it).
+
+Passing the **real** dongle (`--remote-usb 0627:697d`) means the physical
+remote drives the app through the genuine evdev path — including **Back**
+(`KEY_BACK`), which the emulated `usb-kbd` can't deliver. This needs the host
+udev rule installed by `provision.sh` (`vm/udev/80-rabbitears-remote.rules`);
+without it the node is `root:root` and QEMU silently defers the device.
+`uv run task vm-stop` releases the dongle back to the host.
+
 ---
 
 ## Attaching to a running VM's serial console

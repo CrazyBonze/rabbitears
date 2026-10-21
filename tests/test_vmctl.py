@@ -289,7 +289,8 @@ class QemuLifetimeTest(unittest.TestCase):
 
     def test_cmd_run_handles_sigterm_and_sighup(self):
         args = SimpleNamespace(disk="d", display="none", monitor="", usb=None,
-                               host="127.0.0.1", port=4321, remote=True)
+                               host="127.0.0.1", port=4321, remote=True,
+                               remote_usb=None)
         registered = {}
         with mock.patch.object(vmctl, "preflight"), \
                 mock.patch.object(vmctl, "Vm") as vm_cls, \

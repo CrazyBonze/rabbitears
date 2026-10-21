@@ -91,6 +91,7 @@ def qemu_args(
     display: str = "none",
     usb_image: Path | str | None = None,
     remote: bool = True,
+    remote_usb: str | None = None,
 ) -> list[str]:
     """Return the exact qemu-system-x86_64 argv for a validation VM.
 
@@ -104,7 +105,10 @@ def qemu_args(
     omit the monitor entirely.
     ``display``: "none" (default) keeps ``-display none``; "spice" replaces
     it with a SPICE server on port 5910 plus the vdagent virtio-serial
-    channel.
+    channel; "vnc" replaces it with a VNC server on 127.0.0.1:5901. VNC
+    mirrors QEMU's primary display surface (the same one `screendump`
+    captures), so it reliably shows mpv's DRM scanout; SPICE can present a
+    multi-head view (one head per guest GPU) that hides it.
     """
     args = [
         QEMU_BIN,
@@ -125,6 +129,8 @@ def qemu_args(
             "-chardev", "spicevmc,id=spicechannel0,name=vdagent",
             "-device", "virtserialport,chardev=spicechannel0,name=com.redhat.spice.0",
         ]
+    elif display == "vnc":
+        args += ["-vnc", "127.0.0.1:1"]
     else:
         args += ["-display", "none"]
     if monitor_sock is not None:
@@ -132,9 +138,21 @@ def qemu_args(
     # One qemu-xhci controller serves both the stick and the emulated remote,
     # so it's emitted exactly once when either needs it (and not at all when
     # neither does).
-    if usb_image is not None or remote:
+    if usb_image is not None or remote or remote_usb is not None:
         args += ["-device", "qemu-xhci,id=xhci"]
-    if remote:
+    if remote_usb is not None:
+        # Pass the real Adomax dongle through (usb-host): the guest sees the
+        # actual 0627:697d composite device — keyboard + system-control
+        # interfaces — so the app's vendor scan, grab, and the physical
+        # Back/hold-to-repeat all run the real hardware path (like the 3040).
+        # It replaces the emulated usb-kbd; the host can't use the dongle
+        # while the VM holds it. QEMU wants separate integer vendorid/productid.
+        vid, pid = remote_usb.split(":")
+        args += [
+            "-device",
+            f"usb-host,vendorid=0x{vid},productid=0x{pid},bus=xhci.0,id=remote0",
+        ]
+    elif remote:
         # A QEMU usb-kbd reports vendor 0x0627 — the Adomax dongle's ID — so
         # the app's real vendor scan finds it with no VM-specific branch.
         args += ["-device", "usb-kbd,bus=xhci.0,id=remote0"]
@@ -281,6 +299,7 @@ class Vm:
     display: str = "none"
     usb_image: Path | str | None = field(default=None, repr=False, compare=False)
     remote: bool = True
+    remote_usb: str | None = field(default=None, repr=False, compare=False)
 
     def run(self) -> None:
         """Spawn qemu-system-x86_64 with the fixed validation flag list.
@@ -293,6 +312,7 @@ class Vm:
             qemu_args(
                 self.disk,
                 monitor_sock=self.monitor_sock,
+                remote_usb=self.remote_usb,
                 display=self.display,
                 usb_image=self.usb_image,
                 remote=self.remote,
@@ -849,12 +869,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             "spicy --host=127.0.0.1 --port=5910",
             file=sys.stderr,
         )
+    elif args.display == "vnc":
+        print(
+            "[vmctl] VNC display on 127.0.0.1:5901 — connect with: "
+            "vinagre vnc://127.0.0.1:5901",
+            file=sys.stderr,
+        )
     vm = Vm(
         disk=Path(args.disk),
         monitor_sock=Path(args.monitor) if args.monitor else None,
         display=args.display,
         usb_image=Path(args.usb) if args.usb else None,
         remote=args.remote,
+        remote_usb=args.remote_usb,
     )
     vm.run()
     # Ctrl+C, `kill`, and a closed terminal all shut QEMU down cleanly.
@@ -934,9 +961,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument(
         "--display",
-        choices=["none", "spice"],
+        choices=["none", "spice", "vnc"],
         default="none",
-        help="Display device: none (default) or spice (SPICE server on port 5910)",
+        help=(
+            "Display device: none (default), spice (SPICE server on port 5910), "
+            "or vnc (VNC server on 127.0.0.1:5901)"
+        ),
     )
     run_p.add_argument(
         "--usb",
@@ -958,6 +988,15 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="remote",
         action="store_false",
         help="Do not attach the emulated remote.",
+    )
+    run_p.add_argument(
+        "--remote-usb",
+        default=None,
+        metavar="VID:PID",
+        help=(
+            "Pass a real USB remote dongle through (usb-host) instead of the "
+            "emulated usb-kbd, e.g. 0627:697d for the Adomax"
+        ),
     )
 
     ser_p = sub.add_parser("serial", help="Attach to a running VM's serial console")
