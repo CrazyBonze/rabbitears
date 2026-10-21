@@ -66,7 +66,7 @@ class PlayerLike(Protocol):
     def load(self, path: Path, offset: float = 0.0) -> None: ...
     def hide_video(self) -> None: ...
     def show_video(self) -> None: ...
-    def show_osd_text(self, text: str, duration_ms: int) -> None: ...
+    def show_osd_text(self, text: str) -> None: ...
     def clear_osd(self) -> None: ...
     def is_idle(self) -> bool: ...
     def is_running(self) -> bool: ...
@@ -177,13 +177,16 @@ class App:
         # Viewer toggles (orthogonal to NO_SIGNAL/PLAYING).
         self._muted = False
         self._standby = False
-        self._pre_standby_muted = False
         # Info overlay (SCOPE §4.5): shown? + the last time the remaining line
-        # was re-rendered (throttled to ~1/s). _flash_until is the deadline of
-        # the current channel flash (0 = none).
+        # was re-rendered (throttled to ~1/s) + the auto-dismiss deadline.
+        # _flash_until is the deadline of the current channel flash;
+        # _volume_until is the deadline of the transient volume/mute indicator
+        # (all 0 = none).
         self._overlay_shown = False
         self._overlay_updated_at = 0.0
+        self._overlay_until = 0.0  # info overlay auto-dismiss deadline (0 = none)
         self._flash_until = 0.0
+        self._volume_until = 0.0
         # Remote input (SCOPE §4.4): the app is the FIFO reader and the only
         # process that acts on a button. Disabled if the FIFO can't be opened.
         self._buttons_fd: int | None = None
@@ -397,7 +400,6 @@ class App:
             _log.info("%s: power on", source)
         else:
             self._standby = True
-            self._pre_standby_muted = self._muted
             self._clear_overlay("standby")
             self.player.hide_video()
             self.player.set_mute(True)
@@ -409,10 +411,11 @@ class App:
             self.state.volume = new
             self.player.set_volume(new)
             self._state_dirty = True
-        # A volume press unmutes, like a real TV (SCOPE §4.4).
-        if self._muted:
-            self._muted = False
-            self.player.set_mute(False)
+        # Volume and mute are independent (SCOPE §4.4): a volume press changes
+        # the level only — never unmutes. MUTE is the only button that toggles
+        # sound, so a mute→volume press can't "cancel" the mute.
+        self._volume_until = self.clock() + self.config.osd_duration
+        self._show_volume_indicator()
         _log.info(
             "%s: %s -> %d (cap %d)", source, command.value, new, self.config.volume_cap
         )
@@ -420,7 +423,18 @@ class App:
     def _mute(self, source: str) -> None:
         self._muted = not self._muted
         self.player.set_mute(self._muted)
+        self._volume_until = self.clock() + self.config.osd_duration
+        self._show_volume_indicator()
         _log.info("%s: mute %s", source, "on" if self._muted else "off")
+
+    def _show_volume_indicator(self) -> None:
+        """Show the transient volume/mute indicator (SCOPE §4.4 feedback).
+
+        Rendered through the same composed payload as the flash and the
+        overlay (mpv's OSD message layer is a single surface), so a volume
+        press never wipes a channel flash that is still showing.
+        """
+        self._render_osd()
 
     def _zap(self, direction: int, source: str, command: Command) -> None:
         """Tune to the next/prev playable channel in `direction`, skipping empties.
@@ -511,36 +525,23 @@ class App:
             position, loop,
         )
         if flash:
-            self._flash(ch, now)
+            self._flash(now)
         elif self._overlay_shown:
             # Same-channel rollover (EOF/unplayable skip): no channel flash, but
             # the overlay's title/remaining changed, so refresh it (SCOPE §4.5).
-            self._overlay_updated_at = now
-            self._render_overlay()
+            self._render_osd()
 
-    def _flash(self, ch: Channel, now: float) -> None:
+    def _flash(self, now: float) -> None:
         """Channel flash (SCOPE §4.5): CH NN top-right for osd_duration seconds.
 
         Called from ``_tune()`` only for channel arrivals (initial tune, zap,
         standby wake); same-channel rollovers (EOF, unplayable skip) refresh
-        the overlay but do not flash. With the overlay up, the flash is
-        composed into the overlay payload (mpv's OSD message layer is a single
-        surface) and ``_step_osd`` re-sends the overlay-only payload when the
-        flash expires — the flash never wipes the overlay.
+        the overlay but do not flash. Rendered through the shared composed
+        payload, so a flash never wipes an in-flight volume indicator (or the
+        overlay), and ``_step_osd`` re-renders on each expiry.
         """
         self._flash_until = now + self.config.osd_duration
-        if self._overlay_shown:
-            self._overlay_updated_at = now
-            self._render_overlay()
-        else:
-            self.player.show_osd_text(
-                osd_mod.flash_ass(
-                    osd_mod.channel_flash_text(ch.number),
-                    self.config.osd_color,
-                    self.config.osd_font_size,
-                ),
-                int(self.config.osd_duration * 1000),
-            )
+        self._render_osd()
 
     # -- info overlay (SCOPE §4.5) ------------------------------------------
 
@@ -557,74 +558,119 @@ class App:
             duration, self._last_loaded_offset, self.clock() - self._load_time
         )
 
-    def _overlay_text(self) -> str | None:
-        """The current overlay payload (ASS-styled), flash line included
-        while the flash is active; None if there is nothing to show.
+    def _osd_lines(self, now: float) -> list[str]:
+        """Every active OSD line, in one composed payload.
 
-        The overlay is the "small panel" (SCOPE §4.5): half the flash's font
-        size, so three lines fit on screen.
+        mpv's OSD message layer is a single surface: each anchored line
+        (flash top-right, volume/mute bottom-left, overlay centre) is joined
+        into one payload, so a new indicator never wipes one still showing.
         """
+        lines: list[str] = []
+        if self._flash_until > now and self._current is not None:
+            lines.append(osd_mod.flash_line(
+                self._current.number, self.config.osd_color,
+                self.config.osd_font_size,
+            ))
+        if self._muted:
+            # The crossed-speaker icon stays up for as long as the box is
+            # muted (SCOPE §4.4), so the mute state is never just a 2.5s flash.
+            lines.append(osd_mod.volume_line(
+                self.state.volume, True,
+                self.config.osd_color, self.config.osd_font_size,
+            ))
+        elif self._volume_until > now:
+            lines.append(osd_mod.volume_line(
+                self.state.volume, False,
+                self.config.osd_color, self.config.osd_font_size,
+            ))
+        if (
+            self._overlay_shown
+            and self._current is not None
+            and self._last_loaded_path is not None
+        ):
+            lines.append(self._info_block_line())
+        return lines
+
+    def _info_block_line(self) -> str:
+        """The three overlay lines as one anchored block (centre, ``\\an8``)."""
         ch = self._current
-        if ch is None or self._last_loaded_path is None:
-            return None
+        assert ch is not None and self._last_loaded_path is not None
         remaining = self._remaining_seconds()
         title = osd_mod.show_title(self._last_loaded_path)
         remaining_str = osd_mod.format_remaining(
             remaining if remaining is not None else 0.0
         )
-        info_size = max(8, self.config.osd_font_size // 2)
-        if self._flash_until > self.clock():
-            return osd_mod.flash_over_info_ass(
-                ch.number, ch.name, title, remaining_str,
-                self.config.osd_color, self.config.osd_font_size, info_size,
-            )
-        return osd_mod.info_ass(
+        return osd_mod.info_block(
             ch.number, ch.name, title, remaining_str,
-            self.config.osd_color, info_size,
+            self.config.osd_color, self.config.osd_font_size,
         )
 
-    def _render_overlay(self) -> None:
-        """(Re)send the overlay payload to mpv (persistent: duration 0)."""
-        text = self._overlay_text()
-        if text is not None:
-            self.player.show_osd_text(text, 0)
+    def _render_osd(self) -> None:
+        """Render the whole OSD as one payload, or clear it if nothing is up.
+
+        The overlay is persistent (no mpv-side timer), so ``_step_osd`` owns
+        every deadline: it re-renders on each expiry and once a second while
+        the overlay is open (to refresh the remaining line).
+        """
+        now = self.clock()
+        lines = self._osd_lines(now)
+        if lines:
+            self.player.show_osd_text(osd_mod.compose_osd(*lines))
+            if self._overlay_shown:
+                self._overlay_updated_at = now
+        else:
+            self.player.clear_osd()
 
     def _show_overlay(self, source: str) -> None:
         self._overlay_shown = True
-        self._overlay_updated_at = self.clock()
-        self._render_overlay()
+        self._overlay_until = self.clock() + self.config.osd_info_duration
+        self._render_osd()
         _log.info("%s: info -> overlay shown", source)
 
     def _dismiss_overlay(self, source: str, command: Command) -> None:
         self._overlay_shown = False
+        self._overlay_until = 0.0
         self._flash_until = 0.0
-        self.player.clear_osd()
+        self._volume_until = 0.0
+        # Re-render rather than clear: the persistent muted icon (if any) stays.
+        self._render_osd()
         _log.info("%s: %s -> overlay dismissed", source, command.value)
 
     def _clear_overlay(self, reason: str) -> None:
-        """Drop the overlay/flash without a command (standby, NO SIGNAL)."""
-        if self._overlay_shown or self._flash_until:
+        """Drop the overlay/flash/volume/mute indicator without a command
+        (standby, NO SIGNAL)."""
+        if self._overlay_shown or self._flash_until or self._volume_until or self._muted:
             self._overlay_shown = False
+            self._overlay_until = 0.0
             self._flash_until = 0.0
+            self._volume_until = 0.0
             self.player.clear_osd()
             _log.info("overlay dismissed (%s)", reason)
 
     def _step_osd(self, now: float) -> None:
-        """Expire the flash and keep the overlay's remaining line fresh (~1/s).
+        """Expire the flash/volume indicator and the overlay; keep it fresh.
 
-        The flash is a self-expiring ``show-text`` when the overlay is down;
-        when the overlay is up the flash lives inside the overlay payload, so
-        its expiry re-sends the overlay-only payload. The remaining line is
-        re-rendered at most once per second (not on every 10 Hz step).
+        Every line lives in one overlay payload, so an expiry re-renders the
+        rest (dropping just the expired line) instead of wiping them. The info
+        overlay auto-dismisses after ``osd_info_duration`` (SCOPE §4.5). The
+        remaining line is re-rendered at most once per second (not 10 Hz).
         """
+        changed = False
         if self._flash_until and now >= self._flash_until:
             self._flash_until = 0.0
-            if self._overlay_shown:
-                self._overlay_updated_at = now
-                self._render_overlay()
+            changed = True
+        if self._volume_until and now >= self._volume_until:
+            self._volume_until = 0.0
+            changed = True
+        if self._overlay_shown and self._overlay_until and now >= self._overlay_until:
+            self._overlay_shown = False
+            self._overlay_until = 0.0
+            changed = True
+            _log.info("overlay dismissed (timer)")
+        if changed:
+            self._render_osd()
         if self._overlay_shown and now - self._overlay_updated_at >= 1.0:
-            self._overlay_updated_at = now
-            self._render_overlay()
+            self._render_osd()
 
     def _save_state(self) -> None:
         state_mod.save_state(

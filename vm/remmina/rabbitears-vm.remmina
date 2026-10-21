@@ -4,3 +4,6 @@ protocol=VNC
 server=127.0.0.1:5901
 scaling_mode=2
 window_maximize=0
+window_width=1320
+window_height=830
+viewmode=1

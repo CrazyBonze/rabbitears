@@ -65,56 +65,51 @@ class InfoTextTest(unittest.TestCase):
 
 
 class AssWrappersTest(unittest.TestCase):
-    UNESC = "\u0092a0"  # mpv's show-text unescape marker (osd-ass-cc/0)
-    ESC = "\u0092a1"    # ...and the re-escape marker (osd-ass-cc/1)
-
-    def test_flash_is_top_right_with_style(self):
-        out = osd.flash_ass("CH 03", "#33CC33", 72)
-        self.assertTrue(out.startswith(self.UNESC))
+    def test_flash_line_is_top_right_with_style(self):
+        out = osd.flash_line(3, "#33CC33", 36)
         self.assertIn("{\\an9}", out)
         self.assertIn("{\\fnVCR OSD Mono}", out)
-        self.assertIn("{\\fs72}", out)
+        self.assertIn("{\\fs36}", out)
         self.assertIn("{\\c&H33CC33&}", out)
         self.assertIn("{\\bord3}", out)
         self.assertTrue(out.endswith("CH 03"))
 
-    def test_info_is_centred_with_style(self):
-        out = osd.info_ass(3, "X", "Title", "5m 00s", "#33CC33", 36)
-        self.assertTrue(out.startswith(self.UNESC))
+    def test_info_block_is_centred_with_hard_breaks(self):
+        out = osd.info_block(3, "X", "Title", "5m 00s", "#33CC33", 36)
         self.assertIn("{\\an8}", out)
         self.assertIn("{\\fnVCR OSD Mono}", out)
         self.assertIn("{\\fs36}", out)
         self.assertIn("{\\c&H33CC33&}", out)
         self.assertIn("{\\bord3}", out)
-        lines = out.split("\n")
-        self.assertEqual(len(lines), 3)
-        self.assertIn("CH 03 · ", lines[0])
-        self.assertIn("5m 00s remaining", lines[2])
+        # The three overlay lines stay one event: hard \N breaks, not \n.
+        self.assertNotIn("\n", out)
+        self.assertIn("\\N", out)
+        self.assertIn("CH 03 · ", out)
+        self.assertIn("5m 00s remaining", out)
 
-    def test_user_controlled_text_is_re_escaped(self):
-        out = osd.info_ass(3, "We{ird}", "Ti{tle}", "5m 00s", "#33CC33", 36)
-        # The escape marker precedes the name and the title, so a "{" in a
-        # filename can't start an ASS tag.
-        self.assertIn(self.ESC + "We{ird}", out)
-        self.assertIn(self.ESC + "Ti{tle}", out)
+    def test_user_controlled_text_is_ass_escaped(self):
+        out = osd.info_block(3, "We{ird}", "Ti{tle}", "5m 00s", "#33CC33", 36)
+        self.assertIn("We\\{ird\\}", out)
+        self.assertIn("Ti\\{tle\\}", out)
 
-    def test_flash_over_info_has_both_anchors_on_separate_lines(self):
-        out = osd.flash_over_info_ass(3, "X", "Title", "5m 00s",
-                                      "#33CC33", 72, 36)
-        self.assertTrue(out.startswith(self.UNESC))
+    def test_ass_escape_escapes_special_chars(self):
+        self.assertEqual(osd.ass_escape("a{b}c\\d"), "a\\{b\\}c\\\\d")
+
+    def test_flash_over_info_has_both_anchors_on_separate_events(self):
+        out = osd.compose_osd(
+            osd.flash_line(3, "#33CC33", 36),
+            osd.info_block(3, "X", "Title", "5m 00s", "#33CC33", 36),
+        )
         self.assertIn("{\\an9}", out)
         self.assertIn("{\\an8}", out)
-        self.assertIn("{\\fs72}", out)
-        self.assertIn("{\\fs36}", out)
         lines = out.split("\n")
-        # The flash is its own line (ASS anchors position lines, not spans),
-        # above the three overlay lines.
-        self.assertEqual(len(lines), 4)
+        # The flash is its own event; the three overlay lines share the second.
+        self.assertEqual(len(lines), 2)
         self.assertTrue(lines[0].endswith("CH 03"))
         self.assertTrue(lines[1].startswith("{\\an8}"))
-        self.assertTrue(lines[1].endswith(self.ESC + "X"))  # name re-escaped
-        self.assertEqual(lines[2], self.ESC + "Title")      # title re-escaped
-        self.assertEqual(lines[3], "5m 00s remaining")
+        self.assertIn("CH 03 · X", lines[1])
+        self.assertIn("Title", lines[1])
+        self.assertIn("5m 00s remaining", lines[1])
 
     def test_ass_color_converts_rgb_to_bgr(self):
         self.assertEqual(osd.ass_color("#FF0000"), "&H0000FF&")  # red -> BGR swap
@@ -127,9 +122,37 @@ class AssWrappersTest(unittest.TestCase):
             self.assertEqual(osd.ass_color(bad), "&H33CC33&")
 
     def test_font_size_out_of_range_falls_back(self):
-        self.assertIn("{\\fs72}", osd.flash_ass("CH 03", "#33CC33", 4))
-        self.assertIn("{\\fs72}", osd.flash_ass("CH 03", "#33CC33", "big"))
-        self.assertIn("{\\fs48}", osd.flash_ass("CH 03", "#33CC33", 48))
+        self.assertIn("{\\fs36}", osd.flash_line(3, "#33CC33", 4))
+        self.assertIn("{\\fs36}", osd.flash_line(3, "#33CC33", "big"))
+        self.assertIn("{\\fs48}", osd.flash_line(3, "#33CC33", 48))
+
+
+class IconAssWrappersTest(unittest.TestCase):
+    def test_volume_line_unmuted_icon_and_level(self):
+        out = osd.volume_line(55, False, "#33CC33", 36)
+        self.assertIn("{\\an1}", out)
+        self.assertIn("{\\fnpixelart-icons-font}", out)
+        self.assertIn(osd.ICON_VOLUME, out)
+        self.assertIn("{\\fnVCR OSD Mono} 55", out)
+
+    def test_volume_line_muted_shows_crossed_icon_and_level(self):
+        out = osd.volume_line(0, True, "#33CC33", 36)
+        self.assertIn(osd.ICON_MUTED, out)
+        self.assertNotIn(osd.ICON_VOLUME, out)
+        self.assertIn("{\\fnVCR OSD Mono} 0", out)  # level still shown
+
+    def test_volume_line_is_anchored(self):
+        out = osd.volume_line(30, False, "#33CC33", 36)
+        self.assertTrue(out.startswith("{\\an1}"))
+
+    def test_flash_line_is_top_right(self):
+        out = osd.flash_line(3, "#33CC33", 36)
+        self.assertIn("{\\an9}", out)
+        self.assertTrue(out.endswith("CH 03"))
+
+    def test_compose_osd_joins_events_with_newlines(self):
+        out = osd.compose_osd("{\\an9}A", "{\\an1}B")
+        self.assertEqual(out, "{\\an9}A\n{\\an1}B")
 
 
 if __name__ == "__main__":

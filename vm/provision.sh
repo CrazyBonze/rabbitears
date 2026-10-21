@@ -446,6 +446,7 @@ if ! cmp -s "$REMOTE_RULES_SRC" "$REMOTE_RULES_DST" 2>/dev/null; then
   install -m 0644 "$REMOTE_RULES_SRC" "$REMOTE_RULES_DST"
   udevadm control --reload-rules
   udevadm trigger --subsystem-match=usb --attr-match=idVendor=0627 --attr-match=idProduct=697d 2>/dev/null || true
+  udevadm trigger --subsystem-match=input 2>/dev/null || true
   log "Installed udev rule for the remote dongle (0627:697d -> plugdev)."
 fi
 

@@ -147,8 +147,11 @@ which treats it as standby.
 - **Hold-to-repeat** (channel up/down only): the first repeat fires after
   `repeat_delay` (0.5 s), then every `repeat_interval` (0.4 s) while held.
 - **Volume:** each press steps by `volume_step` (5), clamped to `0..volume_cap`
-  (80). A volume press unmutes, like a real TV. Volume persists (throttled to
-  at most one `state.json` write per 2 s).
+  (80). Volume and mute are **independent**: a volume press changes the level
+  only (even while muted, so the pre-set level can be adjusted without a
+  surprise unmute), and `MUTE` is the only button that toggles sound. Volume
+  persists (throttled to at most one `state.json` write per 2 s); mute is
+  session-only and resets to unmuted on boot.
 - The app is the only actor on a button: the evdev daemon writes one line per
   button to a FIFO, the app maps buttons to a `Command` (`commands.py`) and
   runs it through `App.handle` (§10).
@@ -158,6 +161,12 @@ which treats it as standby.
   (`#33CC33`-ish, pixel font, chunky stroke) in the top-right for about 2.5s.
 - **Info overlay (OK):** channel number, channel name, current show/episode
   title (from filename), and time remaining.
+- **Volume/mute indicator:** a press shows a transient (~2.5s) indicator in
+  the bottom-left: a pixel-art speaker icon + the numeric level. While muted,
+  the crossed-speaker icon (with the level) stays up persistently instead of
+  expiring, so the muted state is always visible. Icons are Pixelarticons
+  glyphs (see §10), rendered through the same `osd-overlay`/libass path as the
+  text — no second overlay layer.
 - Readability over composite on the CRT is the bar: large, all-caps, thick
   border.
 
@@ -331,12 +340,9 @@ rabbitears/
 ## 9. Parking lot (post-v1, not committed)
 
 Ideas we want eventually but will **not** start before v1.0:
-- **Icons — Pixelarticons first.** When we need on-screen icons (volume/mute/
-  standby indicators, a channel guide, anything visual beyond text),
-  [Pixelarticons](https://pixelarticons.com) is the first choice, tried before
-  anything else (MIT-licensed free tier, 24×24 pixel grid). The OSD is text-only
-  today and libass renders fonts, not SVGs, so this waits for the first icon
-  surface.
+- **More icons** (standby indicator, channel guide) — reuse the bundled
+  Pixelarticons webfont (see §10); the first icon surface (volume/mute) is now
+  committed and shipped.
 - Channel guide on Home, using `KEY_HOMEPAGE` / `KEY_DELETE`
 - LAN web UI (Flask) for status, manual tuning, and content upload
 - Time-of-day programming blocks (mornings differ from evenings)
@@ -380,6 +386,13 @@ Ideas we want eventually but will **not** start before v1.0:
 | 2026-10-20 | Channel flash fires on *arrivals* only (initial tune, zap, standby wake), not same-channel rollovers (EOF / unplayable skip) | A `CH NN` pop at every episode boundary is the noise §9's "Up Next" cards were deferred to avoid; rollovers still refresh an open overlay's title/remaining |
 | 2026-10-20 | Bundled `VCR OSD Mono` is the OSD face (supersedes `font-dejavu`, which stays as the fallback) | A VCR/CRT-style monospace that matches the "cable box" look and scales at 72 px (unlike bitmap `font-terminus`); DejaVu covers glyphs VCR OSD Mono lacks |
 | 2026-10-21 | Real dongle passthrough via a provisioned udev rule (`plugdev`) + `vmctl.py run --remote-usb` | QEMU runs as the unprivileged desktop user and the stock USB node is `root:root 0664`, so `usb-host` silently defers; a repo-owned rule installed by `provision.sh` grants durable access without a hand-typed host edit |
+| 2026-10-21 | OSD icons are Pixelarticons glyphs from its prebuilt webfont (`pixelart-icons-font.ttf`), bundled like VCR OSD Mono | Pixelarticons ships a TTF with PUA glyphs, so icons are text glyphs drawn through the existing libass renderer — no `overlay-add`/raw-image layer, no font build step; volume/mute is the first icon surface (SCOPE §4.5) |
+| 2026-10-21 | OSD is mpv `osd-overlay` (`ass-events`), not `show-text` | `show-text` is a single ASS event and libass applies only the *first* `\an`/`\pos` tag to the whole message, so flash (top-right), volume (bottom-left), and overlay (centre) could not be positioned independently — everything piled into one corner. `osd-overlay` splits its data on newlines into one event per line, each keeping its own anchor; the overlay block's three lines use a hard `\N` break to stay one centred event |
+| 2026-10-21 | The OSD overlay is owned by its IPC connection, so the player keeps one persistent socket for it | mpv deletes an `osd-overlay` when its creating connection closes; `Player._send` reconnects per command, so a dedicated `_osd_sock` (opened lazily, reused for the app's lifetime) is the only way to keep it alive |
+| 2026-10-21 | The info overlay auto-dismisses (`osd_info_duration`, default 5s) | OK previously left the overlay up until BACK; a timer matches the flash/volume behaviour and keeps the screen clear without a second button press |
+| 2026-10-21 | One OSD font size for flash, overlay, and volume (`osd_font_size`, default 36) | the flash was 2× the overlay/volume, which looked inconsistent; 36 fits the three-line overlay and stays "large, thick" over composite |
+| 2026-10-21 | Volume and mute are independent controls (a volume press never unmutes) | the previous "volume press unmutes" made mute→VOL− blast the sound back on, reading as the two buttons cancelling each other; making them orthogonal (volume = level only, MUTE = sound only) is predictable and matches the kid-proof "nothing surprising happens" goal |
+| 2026-10-21 | The muted icon (crossed speaker + level) is persistent while muted | a 2.5s mute flash was too easy to miss; the mute state is part of the viewer's ongoing state, so it stays up until MUTE is pressed again |
 
 ## 11. Open questions
 - 8GB or 16GB eMMC on each unit? (Affects apk cache headroom.)

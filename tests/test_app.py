@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from rabbitears import app as app_mod
+from rabbitears import osd as osd_mod
 from rabbitears import state as state_mod
 from rabbitears.channels import Channel
 from rabbitears.commands import Command
@@ -41,8 +42,8 @@ class FakePlayer:
     def set_mute(self, muted: bool) -> None:
         self.calls.append(("set_mute", muted))
 
-    def show_osd_text(self, text: str, duration_ms: int) -> None:
-        self.calls.append(("show_osd_text", text, duration_ms))
+    def show_osd_text(self, text: str) -> None:
+        self.calls.append(("show_osd_text", text))
 
     def clear_osd(self) -> None:
         self.calls.append(("clear_osd",))
@@ -450,7 +451,7 @@ class HandleTest(AppTestBase):
             self.assertEqual(app._mode, "NO_SIGNAL")
             self.assertEqual(player.shown_images[-1], self._config(mount).testpattern_path)
 
-    def test_volume_step_clamp_and_unmute(self):
+    def test_volume_step_clamp_and_stays_muted(self):
         with tempfile.TemporaryDirectory() as tmp:
             mount = _make_mount(tmp)
             clock = FakeClock()
@@ -461,15 +462,63 @@ class HandleTest(AppTestBase):
             self.assertEqual(app.status()["volume"], 55)  # step 5
             app.handle(Command.MUTE)
             self.assertTrue(app.status()["muted"])
-            app.handle(Command.VOLUME_DOWN)  # unmutes, 55 -> 50
-            self.assertFalse(app.status()["muted"])
-            self.assertIn(("set_mute", False), player.calls)
+            # A volume press changes the level but must NOT unmute.
+            app.handle(Command.VOLUME_DOWN)  # 55 -> 50, still muted
+            self.assertEqual(app.status()["volume"], 50)
+            self.assertTrue(app.status()["muted"])
+            self.assertNotIn(("set_mute", False), player.calls)
             for _ in range(30):
                 app.handle(Command.VOLUME_UP)
             self.assertEqual(app.status()["volume"], self._config(mount).volume_cap)
             for _ in range(30):
                 app.handle(Command.VOLUME_DOWN)
             self.assertEqual(app.status()["volume"], 0)
+
+    def test_mute_volume_interaction_matrix(self):
+        """Mute and volume are orthogonal: volume changes the level only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock()
+            present = {"present": False}
+            app, player = self._app(mount, clock, present)
+            app.start()  # volume 50, unmuted
+
+            app.handle(Command.VOLUME_UP)
+            self.assertEqual(app.status()["volume"], 55)
+            self.assertFalse(app.status()["muted"])
+
+            app.handle(Command.MUTE)
+            self.assertEqual(app.status()["volume"], 55)  # mute never touches level
+            self.assertTrue(app.status()["muted"])
+
+            app.handle(Command.VOLUME_UP)  # while muted: level +5, STAY muted
+            self.assertEqual(app.status()["volume"], 60)
+            self.assertTrue(app.status()["muted"])
+
+            app.handle(Command.VOLUME_DOWN)  # while muted: level -5, STAY muted
+            self.assertEqual(app.status()["volume"], 55)
+            self.assertTrue(app.status()["muted"])
+
+            app.handle(Command.MUTE)  # unmute: level untouched
+            self.assertEqual(app.status()["volume"], 55)
+            self.assertFalse(app.status()["muted"])
+
+    def test_volume_clamps_at_bounds_while_muted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock()
+            present = {"present": False}
+            app, player = self._app(mount, clock, present)
+            app.start()
+            app.handle(Command.MUTE)
+            for _ in range(20):
+                app.handle(Command.VOLUME_DOWN)
+            self.assertEqual(app.status()["volume"], 0)
+            self.assertTrue(app.status()["muted"])
+            for _ in range(30):
+                app.handle(Command.VOLUME_UP)
+            self.assertEqual(app.status()["volume"], app.config.volume_cap)
+            self.assertTrue(app.status()["muted"])
 
     def test_volume_flush_throttled_to_once_per_2s(self):
         """A burst of volume presses flushes state.json at most once per 2 s."""
@@ -541,7 +590,7 @@ class HandleTest(AppTestBase):
                 app.handle(cmd)
             self.assertEqual(player.calls, [])  # all ignored in standby
 
-    def test_wake_restores_pre_standby_mute_state(self):
+    def test_wake_restores_user_mute_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             mount = _make_mount(tmp)
             clock = FakeClock(150.0)
@@ -550,7 +599,7 @@ class HandleTest(AppTestBase):
             app.start()
             app.step()
             app.handle(Command.MUTE)  # user muted before standby
-            app.handle(Command.POWER)  # standby forces mute on
+            app.handle(Command.POWER)  # standby forces mpv mute on
             player.calls.clear()
             app.handle(Command.POWER)  # wake: restore user mute (still muted)
             self.assertTrue(app.status()["muted"])
@@ -613,7 +662,7 @@ class OverlayTest(AppTestBase):
     def _osd_calls(self, player: FakePlayer) -> list[tuple]:
         return [c for c in player.calls if c[0] in ("show_osd_text", "clear_osd")]
 
-    def test_tune_fires_flash_with_channel_and_duration(self):
+    def test_tune_fires_flash_with_channel(self):
         with tempfile.TemporaryDirectory() as tmp:
             mount = _make_mount(tmp)
             clock = FakeClock(150.0)
@@ -623,10 +672,9 @@ class OverlayTest(AppTestBase):
             app.step()  # tune channel 1
             osd_calls = self._osd_calls(player)
             self.assertEqual(len(osd_calls), 1)
-            name, text, duration = osd_calls[0]
+            name, text = osd_calls[0]
             self.assertEqual(name, "show_osd_text")
             self.assertIn("CH 01", text)
-            self.assertEqual(duration, int(app.config.osd_duration * 1000))  # 2500
 
     def test_eof_retune_does_not_flash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -686,6 +734,22 @@ class OverlayTest(AppTestBase):
             # Second INFO dismisses it.
             player.calls.clear()
             app.handle(Command.INFO)
+            self.assertFalse(app.status()["overlay"])
+            self.assertIn(("clear_osd",), player.calls)
+
+    def test_overlay_auto_dismisses_after_timer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock(150.0)
+            present = {"present": True}
+            app, player = self._app(mount, clock, present)
+            app.start()
+            app.step()
+            app.handle(Command.INFO)
+            self.assertTrue(app.status()["overlay"])
+            # Cross osd_info_duration (5.0s) on the next step -> auto-dismiss.
+            clock.advance(app.config.osd_info_duration + 0.1)
+            app.step()
             self.assertFalse(app.status()["overlay"])
             self.assertIn(("clear_osd",), player.calls)
 
@@ -803,6 +867,133 @@ class OverlayTest(AppTestBase):
             self.assertEqual(app._mode, "NO_SIGNAL")
             self.assertFalse(app.status()["overlay"])
             self.assertIn(("clear_osd",), player.calls)
+
+
+class VolumeIndicatorTest(AppTestBase):
+    """The transient volume/mute OSD indicator (SCOPE §4.5)."""
+
+    def _osd_calls(self, player):
+        return [c for c in player.calls if c[0] in ("show_osd_text", "clear_osd")]
+
+    def test_volume_up_shows_icon_and_level(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock()
+            app, player = self._app(mount, clock, {"present": False})
+            app.start()
+            player.calls.clear()
+            app.handle(Command.VOLUME_UP)
+            shown = [c for c in player.calls if c[0] == "show_osd_text"]
+            self.assertEqual(len(shown), 1)
+            _, text = shown[0]
+            self.assertIn(osd_mod.ICON_VOLUME, text)
+            self.assertIn("55", text)
+
+    def test_mute_shows_crossed_icon_and_level(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock()
+            app, player = self._app(mount, clock, {"present": False})
+            app.start()
+            player.calls.clear()
+            app.handle(Command.MUTE)
+            shown = [c for c in player.calls if c[0] == "show_osd_text"]
+            self.assertEqual(len(shown), 1)
+            _, text = shown[0]
+            self.assertIn(osd_mod.ICON_MUTED, text)
+            self.assertNotIn(osd_mod.ICON_VOLUME, text)
+            self.assertIn("50", text)  # the pre-set level stays visible
+
+    def test_unmute_restores_volume_icon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock()
+            app, player = self._app(mount, clock, {"present": False})
+            app.start()
+            app.handle(Command.MUTE)
+            player.calls.clear()
+            app.handle(Command.MUTE)  # unmute
+            shown = [c for c in player.calls if c[0] == "show_osd_text"]
+            self.assertEqual(len(shown), 1)
+            self.assertIn(osd_mod.ICON_VOLUME, shown[0][1])
+
+    def test_muted_icon_persists_after_transient_expires(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock()
+            app, player = self._app(mount, clock, {"present": False})
+            app.start()
+            app.handle(Command.MUTE)  # persistent muted icon up
+            player.calls.clear()
+            # The 2.5s transient deadline passes; the muted icon must remain.
+            clock.advance(app.config.osd_duration + 0.1)
+            app._step_osd(clock.t)
+            shown = [c for c in player.calls if c[0] == "show_osd_text"]
+            self.assertEqual(len(shown), 1)
+            self.assertIn(osd_mod.ICON_MUTED, shown[0][1])
+            self.assertNotIn(("clear_osd",), player.calls)
+
+    def test_unmute_clears_persistent_icon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock()
+            app, player = self._app(mount, clock, {"present": False})
+            app.start()
+            app.handle(Command.MUTE)   # persistent muted icon up
+            player.calls.clear()
+            app.handle(Command.MUTE)   # unmute -> transient speaker icon
+            shown = [c for c in player.calls if c[0] == "show_osd_text"]
+            self.assertEqual(len(shown), 1)
+            self.assertIn(osd_mod.ICON_VOLUME, shown[0][1])
+            self.assertNotIn(osd_mod.ICON_MUTED, shown[0][1])
+
+    def test_indicator_expires_resets_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock(150.0)
+            app, player = self._app(mount, clock, {"present": True})
+            app.start()
+            app.step()
+            app._volume_until = clock.t + 2.0
+            app._step_osd(clock.t + 3.0)
+            self.assertEqual(app._volume_until, 0.0)
+
+    def test_volume_during_flash_composes_not_clobbers(self):
+        """A volume press while a channel flash is still up joins it, not wipes it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock(150.0)
+            app, player = self._app(mount, clock, {"present": True})
+            app.start()
+            app.step()  # tune channel 1 -> flash "CH 01"
+            player.calls.clear()
+            clock.advance(0.5)  # still within the 2.5s flash window
+            app.handle(Command.VOLUME_UP)
+            shown = [c for c in player.calls if c[0] == "show_osd_text"]
+            self.assertEqual(len(shown), 1)
+            _, text = shown[0]
+            self.assertIn("CH 01", text)             # flash survives the press
+            self.assertIn(osd_mod.ICON_VOLUME, text)  # and the volume line joins it
+            self.assertNotIn(("clear_osd",), player.calls)
+
+    def test_overlay_open_composes_indicator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock(150.0)
+            app, player = self._app(mount, clock, {"present": True})
+            app.start()
+            app.step()
+            app.handle(Command.INFO)
+            self.assertTrue(app.status()["overlay"])
+            app._flash_until = 0.0  # isolate the indicator from the channel flash
+            player.calls.clear()
+            app.handle(Command.VOLUME_UP)
+            shown = [c for c in player.calls if c[0] == "show_osd_text"]
+            self.assertEqual(len(shown), 1)
+            _, text = shown[0]
+            self.assertIn(osd_mod.ICON_VOLUME, text)
+            self.assertIn("CH 01", text)      # overlay still present
+            self.assertIn("Cartoons", text)
 
 
 if __name__ == "__main__":

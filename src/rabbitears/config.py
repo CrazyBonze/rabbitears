@@ -50,8 +50,12 @@ class Config:
     osd_color: str = "#33CC33"
     # Channel-flash duration in seconds (SCOPE §4.5: about 2.5s).
     osd_duration: float = 2.5
-    # OSD font size (SCOPE §4.5: large, all-caps, thick).
-    osd_font_size: int = 72
+    # Info-overlay duration in seconds (SCOPE §4.5: auto-dismisses; longer than
+    # the flash so three lines are readable).
+    osd_info_duration: float = 5.0
+    # OSD font size (SCOPE §4.5: large, all-caps, thick). One size for the
+    # channel flash, the info overlay, and the volume/mute indicator.
+    osd_font_size: int = 36
     # mpv JSON IPC socket (SCOPE §4.3).
     socket_path: Path = field(default_factory=lambda: Path("/run/rabbitears/mpv.sock"))
     # Button FIFO: the evdev daemon (writer) -> the app (reader) (SCOPE §4.4).
@@ -126,6 +130,9 @@ def load_config(path: Path = _DEFAULT_CONFIG_PATH) -> Config:
     osd_duration = _as_float(data.get("osd_duration"), _DEFAULTS.osd_duration)
     if osd_duration <= 0:
         osd_duration = _DEFAULTS.osd_duration
+    osd_info_duration = _as_float(data.get("osd_info_duration"), _DEFAULTS.osd_info_duration)
+    if osd_info_duration <= 0:
+        osd_info_duration = _DEFAULTS.osd_info_duration
     osd_font_size = _as_int(data.get("osd_font_size"), _DEFAULTS.osd_font_size)
     if osd_font_size < 8:
         osd_font_size = _DEFAULTS.osd_font_size
@@ -140,6 +147,7 @@ def load_config(path: Path = _DEFAULT_CONFIG_PATH) -> Config:
         control_socket=_as_path(data.get("control_socket"), _DEFAULTS.control_socket),
         osd_color=_as_str(data.get("osd_color"), _DEFAULTS.osd_color),
         osd_duration=osd_duration,
+        osd_info_duration=osd_info_duration,
         osd_font_size=osd_font_size,
         socket_path=_as_path(data.get("socket_path"), _DEFAULTS.socket_path),
         buttons_path=_as_path(data.get("buttons_path"), _DEFAULTS.buttons_path),

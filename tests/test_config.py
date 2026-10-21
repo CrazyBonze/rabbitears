@@ -16,7 +16,8 @@ class LoadConfigTest(unittest.TestCase):
             self.assertEqual(cfg.volume_cap, 80)
             self.assertEqual(cfg.osd_color, "#33CC33")
             self.assertEqual(cfg.osd_duration, 2.5)
-            self.assertEqual(cfg.osd_font_size, 72)
+            self.assertEqual(cfg.osd_info_duration, 5.0)
+            self.assertEqual(cfg.osd_font_size, 36)
             self.assertEqual(cfg.socket_path, Path("/run/rabbitears/mpv.sock"))
             self.assertEqual(cfg.mount_point, Path("/media/rabbitears"))
             self.assertEqual(cfg.testpattern_path, Path("/usr/share/rabbitears/testpattern.png"))
@@ -76,7 +77,7 @@ class LoadConfigTest(unittest.TestCase):
             )
             cfg = load_config(path)
             self.assertEqual(cfg.volume_cap, 60)
-            self.assertEqual(cfg.osd_font_size, 72)  # default, not polluted
+            self.assertEqual(cfg.osd_font_size, 36)  # default, not polluted
             self.assertFalse(hasattr(cfg, "not_a_real_key"))
 
     def test_socket_path_and_mount_point_are_paths(self):
@@ -192,12 +193,24 @@ class OsdRangeChecksTest(unittest.TestCase):
             path.write_text("osd_duration = -1.5\n")
             self.assertEqual(load_config(path).osd_duration, 2.5)
 
+    def test_osd_info_duration_valid_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("osd_info_duration = 8.0\n")
+            self.assertEqual(load_config(path).osd_info_duration, 8.0)
+
+    def test_osd_info_duration_nonpositive_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("osd_info_duration = 0\n")
+            self.assertEqual(load_config(path).osd_info_duration, 5.0)  # default
+
     def test_osd_font_size_below_eight_falls_back(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.toml"
             path.write_text("osd_font_size = 4\nosd_duration = 4.0\n")
             cfg = load_config(path)
-            self.assertEqual(cfg.osd_font_size, 72)  # default
+            self.assertEqual(cfg.osd_font_size, 36)  # default
             self.assertEqual(cfg.osd_duration, 4.0)  # preserved
 
     def test_osd_font_size_eight_is_valid(self):

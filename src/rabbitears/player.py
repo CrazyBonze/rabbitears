@@ -68,6 +68,11 @@ class Player:
         self.mpv_bin = mpv_bin
         self._proc: subprocess.Popen | None = None
         self._request_id: int = 0
+        # The osd-overlay is owned by the IPC connection that created it (mpv
+        # removes it when that connection closes), so it lives on a socket kept
+        # open for the app's lifetime — unlike _send, which reconnects per
+        # command.
+        self._osd_sock: socket.socket | None = None
 
     def start(self) -> None:
         """Launch mpv and wait (up to 5s) for the IPC socket to appear.
@@ -120,6 +125,14 @@ class Player:
             self._proc.kill()
             self._proc.wait()
         self._proc = None
+        self._close_osd_sock()
+
+    def _close_osd_sock(self) -> None:
+        """Close the persistent OSD connection, if any."""
+        if self._osd_sock is not None:
+            with contextlib.suppress(OSError):
+                self._osd_sock.close()
+            self._osd_sock = None
 
     def _send(self, command: list) -> dict:
         """Send one JSON IPC command and return the parsed response.
@@ -221,23 +234,64 @@ class Player:
         """Enable or disable mute."""
         self._send(["set_property", "mute", bool(muted)])
 
-    def show_osd_text(self, text: str, duration_ms: int) -> None:
-        """Show ``text`` on the OSD (mpv ``show-text``).
+    def show_osd_text(self, text: str) -> None:
+        """Show ``text`` as an ASS overlay (mpv ``osd-overlay``, ``ass-events``).
 
-        ``duration_ms > 0``: the text clears itself after that many
-        milliseconds (the channel flash). ``duration_ms <= 0``: the text stays
-        until the next ``show-text``/``clear_osd`` (the info overlay). ``text``
-        may contain ASS override tags (``{\\an9}``, ``{\\fs72}``, ...), which
-        mpv's libass applies. Verified against mpv 0.41 (Alpine 3.24) in the VM.
+        ``text`` is split on newlines into one ASS event per line, each with
+        its own ``\\an`` anchor (top-right flash, bottom-left volume, centred
+        overlay). The overlay is persistent until :meth:`clear_osd` (or the app
+        re-sends it), so the app owns expiry.
         """
-        if duration_ms > 0:
-            self._send(["show-text", text, duration_ms])
-        else:
-            self._send(["show-text", text])
+        self._osd_command(
+            ["osd-overlay", 0, "ass-events", text, 0, 288, 0, False, False]
+        )
 
     def clear_osd(self) -> None:
-        """Remove any OSD text now showing (an empty ``show-text`` clears it)."""
-        self._send(["show-text", ""])
+        """Remove the ASS overlay (``osd-overlay`` with the ``none`` format)."""
+        self._osd_command(["osd-overlay", 0, "none", "", 0, 288, 0, False, False])
+
+    def _osd_command(self, command: list) -> None:
+        """Send an ``osd-overlay`` command over the persistent OSD socket.
+
+        The overlay is owned by the IPC connection that created it (mpv removes
+        it when that connection closes), so it must stay on one long-lived
+        socket rather than the per-command connection :meth:`_send` uses.
+        """
+        self._request_id += 1
+        rid = self._request_id
+        payload = {"command": command, "request_id": rid}
+        try:
+            if self._osd_sock is None:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(_IPC_TIMEOUT)
+                s.connect(str(self.socket_path))
+                self._osd_sock = s
+            s = self._osd_sock
+            s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            while True:
+                chunk = s.recv(4096).decode("utf-8", errors="replace")
+                if not chunk:
+                    raise PlayerError(f"OSD connection closed for {command!r}")
+                for _line in chunk.split("\n"):
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    try:
+                        msg = json.loads(_line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    if "event" in msg:
+                        continue
+                    if msg.get("request_id") != rid:
+                        continue
+                    if msg.get("error", "success") != "success":
+                        raise PlayerError(f"mpv error for {command!r}: {msg!r}")
+                    return
+        except (OSError, TimeoutError, ValueError) as e:
+            self._close_osd_sock()
+            raise PlayerError(f"OSD IPC failure for {command!r}: {e}") from e
 
     def hide_video(self) -> None:
         """Hide video (standby): mpv keeps running, screen goes black."""

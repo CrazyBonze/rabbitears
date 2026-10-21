@@ -7,6 +7,11 @@
 # That user cannot open the node O_RDWR (EACCES), so QEMU's usb-host device
 # silently defers and the guest never sees the remote.
 #
-# Put the node in the plugdev group (the desktop user is a member) so QEMU can
-# claim it. Installed to /etc/udev/rules.d/ by vm/provision.sh.
+# Put the nodes in the plugdev group (the desktop user is a member): the USB
+# node so QEMU can claim it via usb-host, and the /dev/input/event* nodes so
+# host-side tools (tools/remote-mirror.py) can read the buttons directly.
+# The input nodes are root:input 0660 by stock rules, so they need their own
+# rule — matched through the USB parent's idVendor/idProduct via ATTRS{}.
+# Installed to /etc/udev/rules.d/ by vm/provision.sh.
 SUBSYSTEM=="usb", ATTR{idVendor}=="0627", ATTR{idProduct}=="697d", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="input", ATTRS{idVendor}=="0627", ATTRS{idProduct}=="697d", GROUP="plugdev", MODE="0660"

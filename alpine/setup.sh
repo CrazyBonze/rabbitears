@@ -180,10 +180,12 @@ for _dev in /dev/sd*; do
   MDEV="$_name" ACTION=add /etc/rabbitears/mdev-usb
 done
 
-# The bundled OSD font (VCR OSD Mono, SCOPE §4.5). A dedicated subdir keeps the
-# lbu include scoped (not the whole /usr/share/fonts, which also holds the
-# font-dejavu package); fontconfig scans subdirs, so it's still found.
+# The bundled OSD fonts (SCOPE §4.5): VCR OSD Mono (text) + Pixelarticons
+# (pixel-art icons, SCOPE §9). A dedicated subdir keeps the lbu include scoped
+# (not the whole /usr/share/fonts, which also holds the font-dejavu package);
+# fontconfig scans subdirs, so both are still found.
 install_file "${REPO_ROOT}/system/fonts/VCR_OSD_Mono.ttf" /usr/share/fonts/rabbitears/VCR_OSD_Mono.ttf 0644
+install_file "${REPO_ROOT}/system/fonts/pixelart-icons-font.ttf" /usr/share/fonts/rabbitears/pixelart-icons-font.ttf 0644
 fc-cache -f >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------

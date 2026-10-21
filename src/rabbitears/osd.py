@@ -5,22 +5,26 @@ from the app, the player, or mpv. It turns plain inputs (a channel number, a
 title, a duration, an offset) into the display strings the app shows through
 ``player.show_osd_text``.
 
-The strings are mpv ``show-text`` payloads. Two mpv 0.41 quirks shape them
-(both verified against mpv 0.41 in the VM):
+The strings are mpv ``osd-overlay`` payloads (``ass-events`` format). Two mpv
+0.41 facts shape them (both verified against mpv 0.41 in the VM):
 
-* ``show-text`` *escapes* ASS tags by default. The payloads therefore start
-  with the unescape marker (U+0092 ``a0`` — what the ``osd-ass-cc/0``
-  property expands to), and user-controlled text (channel name, title) is
-  re-escaped with the escape marker (U+0092 ``a1``) so a ``{`` in a filename
-  can't start a tag.
-* ASS anchor tags position *lines*, not spans: the flash and the overlay must
-  be on separate lines. mpv's OSD message layer is a single surface, so when
-  both are up they are composed into one payload (``flash_over_info_ass``);
-  the app re-sends the overlay-only payload when the flash expires, so a
-  flash never wipes the overlay.
+* ``osd-overlay`` splits its ``data`` on newlines into one ASS *event per
+  line*, and libass applies the first ``\\an``/``\\pos`` of each event to that
+  event alone. Each element (flash top-right, volume/mute bottom-left, overlay
+  centre) is therefore its own line, so a ``show-text`` cannot position them
+  independently but ``osd-overlay`` can. The overlay block's own three lines
+  use a hard ``\\N`` break so they stay one centred event.
+* ``osd-overlay`` does *not* escape ASS tags. User-controlled text (channel
+  name, title) is escaped here with :func:`ass_escape`, so a ``{`` in a
+  filename can't start a tag.
 
-Font sizes are relative: 288 = full screen height, so the flash uses
-``osd_font_size`` (72 ≈ a quarter of the screen) and the overlay uses half.
+The overlay is owned by the IPC connection that created it, so the player keeps
+a persistent socket for it (see ``Player._osd_command``).
+
+Font sizes are relative: 288 = full screen height. Every OSD element (the
+channel flash, the info overlay, and the volume/mute indicator) uses the same
+``osd_font_size`` (36 ≈ an eighth of the screen), so a zap and a volume press
+produce the same-sized text.
 """
 
 from __future__ import annotations
@@ -30,18 +34,28 @@ from pathlib import Path
 # ASS stores colour as &HBBGGRR& (BGR, not RGB). The default is the config
 # default green, #33CC33 (palindromic, so identical in RGB and BGR).
 _DEFAULT_COLOR = "&H33CC33&"
-_DEFAULT_FONT_SIZE = 72
+_DEFAULT_FONT_SIZE = 36
 _BORDER = 3  # thick border: readability over composite on a CRT (SCOPE §4.5)
 # The bundled OSD face (system/fonts/VCR_OSD_Mono.ttf, installed to
 # /usr/share/fonts/rabbitears/ by alpine/setup.sh). A VCR/CRT-style monospace
 # that fits the "cable box" look (SCOPE §4.5); referenced by the ASS \fn tag.
 _FONT = "VCR OSD Mono"
 
-# mpv's show-text escapes ASS tags unless the unescape marker (U+0092 "a0")
-# precedes them; the escape marker (U+0092 "a1") re-enables escaping for the
-# user-controlled text (channel name, title) so a "{" in a filename is safe.
-_ASS_UNESCAPE = "\u0092a0"
-_ASS_ESCAPE = "\u0092a1"
+# osd-overlay passes its data to libass verbatim, so user-controlled text (the
+# channel name, the title) must be ASS-escaped: a "{" in a filename would
+# otherwise start an override tag.
+def ass_escape(text: str) -> str:
+    """Escape ``text`` for literal display in an ASS event (never crash)."""
+    return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+# The bundled icon face (system/fonts/pixelart-icons-font.ttf). Pixelarticons
+# (MIT, SCOPE §9) ships a prebuilt TTF whose glyphs sit in the private-use
+# area; the app renders them inline via ``\fn``, the same single-renderer path
+# as the text face (SCOPE §4.5 decision log).
+_ICON_FONT = "pixelart-icons-font"
+# Icon glyphs (PUA codepoints from pixelart-icons-font.ttf, from the font's CSS):
+ICON_VOLUME = "\uedee"   # "volume" — a speaker
+ICON_MUTED = "\ueded"    # "volume-x" — a speaker with an X
 
 
 def channel_flash_text(number: int) -> str:
@@ -136,15 +150,36 @@ def _style(color: object, font_size: object) -> str:
     )
 
 
-def flash_ass(flash_text: str, color: object, font_size: object) -> str:
-    """The channel flash payload: top-right (``\\an9``), large, bordered.
+def compose_osd(*lines: str) -> str:
+    """Join anchored ASS event fragments into one ``osd-overlay`` payload.
 
-    ``flash_text`` is app-generated (``CH NN``), so no re-escaping is needed.
+    Each fragment is a complete ASS event (its own ``\\an`` anchor and style);
+    ``osd-overlay`` splits the data on newlines into one event per line, so
+    each keeps its own anchor.
     """
-    return f"{_ASS_UNESCAPE}{{\\an9}}{_style(color, font_size)}{flash_text}"
+    return "\n".join(lines)
 
 
-def _info_payload(
+def flash_line(number: int, color: object, font_size: object) -> str:
+    """The channel-flash line (top-right ``\\an9``) for :func:`compose_osd`."""
+    return f"{{\\an9}}{_style(color, font_size)}{channel_flash_text(number)}"
+
+
+def volume_line(level: int, muted: bool, color: object, font_size: object) -> str:
+    """The volume/mute indicator line (bottom-left ``\\an1``) for ``compose_osd``.
+
+    The icon glyph uses the bundled Pixelarticons face, the numeric level the
+    OSD face — two inline ``\\fn`` spans on one line. The level is always shown
+    (SCOPE §4.4: volume and mute are independent, so a muted press still
+    reveals the pre-set level); only the icon changes with mute state.
+    """
+    size = _font_size(font_size)
+    icon = ICON_MUTED if muted else ICON_VOLUME
+    body = f"{{\\fn{_ICON_FONT}}}{icon}{{\\fn{_FONT}}} {level}"
+    return f"{{\\an1}}{{\\fs{size}}}{{\\c{ass_color(color)}}}{{\\bord{_BORDER}}}{body}"
+
+
+def info_block(
     number: int, name: str, title: str, remaining: str,
     color: object, font_size: object,
 ) -> str:
@@ -156,37 +191,12 @@ def _info_payload(
     _channel_line, title_line, remaining_line = _info_lines(
         number, name, title, remaining
     )
+    # Hard \N breaks keep the three overlay lines in ONE event (so the single
+    # \an8 centres the whole block), unlike the \n that splits osd-overlay
+    # events apart.
     return (
         f"{{\\an8}}{_style(color, font_size)}"
-        f"CH {number:02d} · {_ASS_ESCAPE}{name}\n"
-        f"{_ASS_ESCAPE}{title_line}\n"
+        f"CH {number:02d} · {ass_escape(name)}\\N"
+        f"{ass_escape(title_line)}\\N"
         f"{remaining_line}"
-    )
-
-
-def info_ass(
-    number: int, name: str, title: str, remaining: str,
-    color: object, font_size: object,
-) -> str:
-    """The info overlay payload: centre screen (``\\an8``), bordered."""
-    return _ASS_UNESCAPE + _info_payload(
-        number, name, title, remaining, color, font_size
-    )
-
-
-def flash_over_info_ass(
-    number: int, name: str, title: str, remaining: str,
-    color: object, flash_font_size: object, info_font_size: object,
-) -> str:
-    """Flash + overlay in one payload: flash top-right, overlay centre.
-
-    ASS anchor tags position *lines*, so the flash is its own line above the
-    overlay block. Used when the overlay is up and a tune fires the flash;
-    the app re-sends the overlay-only payload (``info_ass``) when the flash
-    expires, so the flash never wipes the overlay.
-    """
-    return (
-        f"{_ASS_UNESCAPE}{{\\an9}}{_style(color, flash_font_size)}"
-        f"{channel_flash_text(number)}\n"
-        + _info_payload(number, name, title, remaining, color, info_font_size)
     )

@@ -19,6 +19,8 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "taskipy>=1.14.1",
+    "evdev>=1.6.1",
+    "pygame-ce>=2.4.1",
 ]
 
 # Common tasks: `uv run task --list`, `uv run task <name> [extra args]`.
@@ -62,3 +64,4 @@ vm-key = { cmd = "python vm/vmctl.py key", help = "Press a remote button in the 
 remote-unplug = { cmd = "python vm/vmctl.py remote unplug", help = "Hot-unplug the emulated remote (usb-kbd) from the running VM" }
 remote-plug = { cmd = "python vm/vmctl.py remote plug", help = "Re-insert the emulated remote (usb-kbd) into the running VM" }
 vm-powerbutton = { cmd = "python vm/vmctl.py powerbutton", help = "Press the ACPI power button in the VM (QMP system_powerdown)" }
+remote-mirror = { cmd = "python tools/remote-mirror.py", help = "Host-side remote mirror: read the dongle, show the pressed button, relay to the running VM (run vm-run-usb-vnc first, not --remote-usb)" }

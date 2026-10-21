@@ -1,4 +1,4 @@
-# system/fonts — bundled OSD font
+# system/fonts — bundled OSD fonts
 
 ## VCR OSD Mono
 
@@ -19,3 +19,18 @@ include stays scoped, not the whole font dir) and referenced by
 `src/rabbitears/osd.py` via the ASS `\fnVCR OSD Mono` tag. `font-dejavu`
 (`alpine/packages.txt`) stays as the fontconfig fallback for glyphs VCR OSD
 Mono lacks (e.g. accented characters in filenames).
+
+## Pixelarticons (icon font)
+
+- **File:** `pixelart-icons-font.ttf`
+- **Author:** Gerrit Halfmann
+- **Source:** <https://pixelarticons.com> (npm package `pixelarticons`, `fonts/pixelart-icons-font.ttf`)
+- **License:** MIT (`LICENSE` in the package; SCOPE §9).
+
+The on-screen icons (volume, mute) are glyphs from Pixelarticons' prebuilt
+webfont, drawn on a strict 24×24 pixel grid. Icons live in the private-use area
+(`U+EA01–U+EE0C`); the two the app uses are `U+EDEE` ("volume") and `U+EDED`
+("volume-x"), referenced by `src/rabbitears/osd.py` (`ICON_VOLUME`,
+`ICON_MUTED`) via the ASS `\fnpixelart-icons-font` tag. Rendered through the
+same `show-text`/libass path as the text face — no second overlay layer
+(SCOPE §4.5 decision log).
