@@ -68,7 +68,7 @@ DEFAULT_SCREENSHOT_OUT = "vm/screenshot.png"
 DEFAULT_DISK = "/var/lib/libvirt/images/rabbitears-vm.qcow2"
 
 # Remote button name -> QEMU key qcode for `vmctl.py key` (Part 4, SCOPE §4.4).
-# The qcodes mirror the evdev codes the real Adomax remote sends (REPORT.md §2).
+# The qcodes mirror the evdev codes the real Adomax remote sends (docs/remote.md §2).
 KEY_QCODES: dict[str, str] = {
     "up": "up",
     "down": "down",

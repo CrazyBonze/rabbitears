@@ -32,7 +32,7 @@
 
 If any of these is missing, stop and report. Don't re-implement them. Where the real `app.py` differs in detail from what this prompt assumes, adapt to the existing code rather than rewriting it, and report the differences.
 
-Work from the repository root (paths below are repo-relative). Read these in full before making changes: `AGENTS.md`, `SCOPE.md` (especially §4.4, §4.6, §3 "Power button"), `REPORT.md` (the verified button map), `docs/prompts/first-channel-vm-playback.md`, `vm/VAGRANT.md`, `pyproject.toml` (`[tool.taskipy]`), `vm/vmctl.py`, `alpine/setup.sh`, `alpine/verify.sh`, `alpine/packages.txt`, `system/openrc/rabbitears`, everything in `src/rabbitears/`, and `tests/test_app.py` and `tests/test_vmctl.py`.
+Work from the repository root (paths below are repo-relative). Read these in full before making changes: `AGENTS.md`, `SCOPE.md` (especially §4.4, §4.6, §3 "Power button"), `docs/remote.md` (the verified button map), `docs/prompts/first-channel-vm-playback.md`, `vm/VAGRANT.md`, `pyproject.toml` (`[tool.taskipy]`), `vm/vmctl.py`, `alpine/setup.sh`, `alpine/verify.sh`, `alpine/packages.txt`, `system/openrc/rabbitears`, everything in `src/rabbitears/`, and `tests/test_app.py` and `tests/test_vmctl.py`.
 
 ---
 
@@ -164,7 +164,7 @@ The main loop in `app.py`:
 
 ### 2b. `src/rabbitears/remote.py`: evdev remote
 
-**Keymap.** Use numeric evdev codes as named module constants, so tests don't need evdev. Use `REPORT.md` §2:
+**Keymap.** Use numeric evdev codes as named module constants, so tests don't need evdev. Use `docs/remote.md` §2:
 
 | Code | Command |
 |---|---|
@@ -184,7 +184,7 @@ Every other key (left, right, home, menu, sun, screen-arrow, mouse buttons) is i
 - **A mapped press emits its command immediately.**
 - **Only `CHANNEL_UP`/`CHANNEL_DOWN` repeat** (SCOPE §4.4). While held, emit again after `repeat_delay`, then every `repeat_interval`, until release. Don't emit a burst to catch up if `poll` runs late: at most one repeat per poll.
 - If a second repeatable key is pressed while one is held, the newer one takes over (TV behaviour).
-- `value == 2` (kernel autorepeat) is ignored. The remote sends clean press/release pairs (REPORT.md §3), and the app owns repeat.
+- `value == 2` (kernel autorepeat) is ignored. The remote sends clean press/release pairs (docs/remote.md §3), and the app owns repeat.
 
 **`RemoteInput(InputSource)`**
 - **Discovery.**
@@ -234,7 +234,7 @@ The app's exclusive grab covers the remote's `KEY_POWER` while the app runs. It 
 
 ## Part 4: `vm/vmctl.py`: an emulated remote
 
-**Why `usb-kbd` works:** QEMU's emulated USB HID devices report vendor ID **`0x0627`**, the same ID the Adomax dongle uses (`REPORT.md` §1). That makes a QEMU `usb-kbd` a faithful stand-in: the app's real vendor scan finds it with no VM-specific branch. **Verify this inside the guest** (`cat /sys/class/input/event*/device/id/vendor`). If it doesn't hold, stop and report. Don't add a VM-only config override.
+**Why `usb-kbd` works:** QEMU's emulated USB HID devices report vendor ID **`0x0627`**, the same ID the Adomax dongle uses (`docs/remote.md` §1). That makes a QEMU `usb-kbd` a faithful stand-in: the app's real vendor scan finds it with no VM-specific branch. **Verify this inside the guest** (`cat /sys/class/input/event*/device/id/vendor`). If it doesn't hold, stop and report. Don't add a VM-only config override.
 
 ### 4a. `run --remote / --no-remote` (default: remote attached)
 

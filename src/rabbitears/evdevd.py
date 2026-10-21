@@ -36,7 +36,7 @@ from .remote import name_for_code
 
 _log = logging.getLogger("rabbitears.evdevd")
 
-# The Adomax 2.4GHz remote's USB vendor ID (SCOPE §4.4, REPORT.md §1). The real
+# The Adomax 2.4GHz remote's USB vendor ID (SCOPE §4.4, docs/remote.md §1). The real
 # value comes from config.remote_vendor; this is the documented default.
 VENDOR = 0x0627
 # input-event type for a key (evdev.ecodes.EV_KEY); kept literal so the pure

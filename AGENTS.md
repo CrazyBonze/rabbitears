@@ -74,5 +74,5 @@ Kid-safe "cable box" for a Dell Wyse 3040: Alpine (diskless + lbu), OpenRC, one 
 ## Docs and workflow
 
 - `docs/prompts/*.md` are task prompts the user hands to agents. When executing one, read every file it lists first, satisfy its completion criteria, and answer its "Report back with" section. If it changes commands or the dev loop, update this file.
-- `REPORT.md` is the verified remote dossier (button map, USB ID `0627:697d`). It still says "Zapbox"/Arch; SCOPE refers to this content as `docs/remote.md`, which doesn't exist yet.
+- `docs/remote.md` is the verified remote dossier (button map, USB ID `0627:697d`).
 - **Never commit or push unless the user asks.** Existing commit style is imperative and short, sometimes tagged with a milestone, e.g. `Add config.py + state.py with unit tests (M2 core)`.

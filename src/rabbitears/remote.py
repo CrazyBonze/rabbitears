@@ -9,7 +9,7 @@ the app via an injected ``handle(command)`` callback. The app is the only
 process that acts on a button (SCOPE §4.4).
 
 The remote is the Adomax 2.4GHz USB remote (``0627:697d``), read via evdev key
-codes (SCOPE §4.4, REPORT.md §2) — **not** NEC1/IR. Every button comes from the
+codes (SCOPE §4.4, docs/remote.md §2) — **not** NEC1/IR. Every button comes from the
 keyboard interface; Power is also on the System Control interface. The remote
 sends clean press/release pairs and does **not** autorepeat, so holding a button
 sends one press and one release; the app-side repeat is what makes it repeat.
@@ -27,7 +27,7 @@ from .commands import Command
 
 _log = logging.getLogger("rabbitears")
 
-# evdev key code -> button name (SCOPE §4.4 + REPORT.md §2, verified live).
+# evdev key code -> button name (SCOPE §4.4 + docs/remote.md §2, verified live).
 # The MVP set (SCOPE §4.4) plus the reserved buttons the app must recognize and
 # ignore (M3). A code not in this map is dropped by the daemon and by parse_line.
 BUTTONS: dict[int, str] = {
@@ -42,7 +42,7 @@ BUTTONS: dict[int, str] = {
     28:  "ok",            # KEY_ENTER
     158: "back",          # KEY_BACK
     127: "menu",          # KEY_COMPOSE (reserved, M3)
-    1:   "home",          # KEY_HOME    (reserved, M3; REPORT.md says HOMEPAGE 172)
+    1:   "home",          # KEY_HOME    (reserved, M3; docs/remote.md says HOMEPAGE 172)
     14:  "sun",           # KEY_BACKSPACE (reserved, M3)
     111: "screen-arrow",  # KEY_DELETE  (reserved, M3)
 }

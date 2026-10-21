@@ -203,7 +203,8 @@ rabbitears/
 ├── docs/
 │   ├── remote.md             # remote dossier (button map, USB IDs)
 │   ├── hardware.md           # 3040 notes, BIOS settings, adapters, video chain
-│   └── alpine-install.md     # step-by-step diskless install + lbu procedure
+│   ├── alpine-install.md     # step-by-step diskless install + lbu procedure
+│   └── screenshots/          # README screenshots (playback, flash, overlay, NO SIGNAL)
 ├── src/rabbitears/
 │   ├── __main__.py           # thin entry point (python -m rabbitears)
 │   ├── app.py                # the app: state machine, tuning, failure recovery
