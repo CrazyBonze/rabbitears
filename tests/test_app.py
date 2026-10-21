@@ -41,8 +41,11 @@ class FakePlayer:
     def set_mute(self, muted: bool) -> None:
         self.calls.append(("set_mute", muted))
 
-    def set_pause(self, paused: bool) -> None:
-        self.calls.append(("set_pause", paused))
+    def show_osd_text(self, text: str, duration_ms: int) -> None:
+        self.calls.append(("show_osd_text", text, duration_ms))
+
+    def clear_osd(self) -> None:
+        self.calls.append(("clear_osd",))
 
     def show_image(self, path: Path) -> None:
         self.shown_images.append(path)
@@ -111,6 +114,21 @@ class AppTestBase(unittest.TestCase):
             media_present_fn=lambda mp: present["present"],
         )
         return app, player
+
+    def _gap_mount(self, tmp: str, files: dict) -> Path:
+        """Build channels/ with the given dir -> {filename: duration} mapping."""
+        mount = Path(tmp)
+        index = {}
+        for dirname, mapping in files.items():
+            d = mount / "channels" / dirname
+            d.mkdir(parents=True)
+            for fname, dur in mapping.items():
+                (d / fname).write_bytes(b"")
+                index[fname] = dur
+        rb = mount / ".rabbitears"
+        rb.mkdir()
+        (rb / "index.json").write_text(json.dumps(index))
+        return mount
 
 
 class PureHelpersTest(unittest.TestCase):
@@ -351,21 +369,6 @@ class AppBehaviorTest(AppTestBase):
 class HandleTest(AppTestBase):
     """The Part 1b state table: handle(Command) across states."""
 
-    def _gap_mount(self, tmp, files):
-        """Build channels/ with the given dir -> {filename: duration} mapping."""
-        mount = Path(tmp)
-        index = {}
-        for dirname, mapping in files.items():
-            d = mount / "channels" / dirname
-            d.mkdir(parents=True)
-            for fname, dur in mapping.items():
-                (d / fname).write_bytes(b"")
-                index[fname] = dur
-        rb = mount / ".rabbitears"
-        rb.mkdir()
-        (rb / "index.json").write_text(json.dumps(index))
-        return mount
-
     def test_channel_up_wraps_and_skips_gaps(self):
         with tempfile.TemporaryDirectory() as tmp:
             mount = self._gap_mount(tmp, {
@@ -568,18 +571,25 @@ class HandleTest(AppTestBase):
             self.assertEqual(player.shown_images[-1], self._config(mount).testpattern_path)
             self.assertIn(("show_video",), player.calls)
 
-    def test_info_back_no_player_calls(self):
+    def test_status_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             mount = _make_mount(tmp)
             clock = FakeClock(150.0)
             present = {"present": True}
             app, player = self._app(mount, clock, present)
             app.start()
+            self.assertEqual(app.status(), {
+                "state": "no_signal", "standby": False, "channel": None,
+                "channel_name": None, "file": None, "volume": 50, "muted": False,
+                "overlay": False, "remaining": None,
+            })
             app.step()
-            player.calls.clear()
-            app.handle(Command.INFO)
-            app.handle(Command.BACK)
-            self.assertEqual(player.calls, [])
+            self.assertEqual(app.status()["state"], "playing")
+            self.assertEqual(app.status()["channel"], 1)
+            self.assertEqual(app.status()["file"], "b.mp4")
+            self.assertFalse(app.status()["overlay"])
+            # b.mp4 @50 of 200s: 150s remaining.
+            self.assertEqual(app.status()["remaining"], 150.0)
 
     def test_no_signal_channel_ignored_volume_mute_work(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -597,21 +607,202 @@ class HandleTest(AppTestBase):
             app.handle(Command.MUTE)
             self.assertIn(("set_mute", True), player.calls)
 
-    def test_status_fields(self):
+class OverlayTest(AppTestBase):
+    """The M4 info overlay + channel flash (SCOPE §4.5)."""
+
+    def _osd_calls(self, player: FakePlayer) -> list[tuple]:
+        return [c for c in player.calls if c[0] in ("show_osd_text", "clear_osd")]
+
+    def test_tune_fires_flash_with_channel_and_duration(self):
         with tempfile.TemporaryDirectory() as tmp:
             mount = _make_mount(tmp)
             clock = FakeClock(150.0)
             present = {"present": True}
             app, player = self._app(mount, clock, present)
             app.start()
-            self.assertEqual(app.status(), {
-                "state": "no_signal", "standby": False, "channel": None,
-                "channel_name": None, "file": None, "volume": 50, "muted": False,
-            })
+            app.step()  # tune channel 1
+            osd_calls = self._osd_calls(player)
+            self.assertEqual(len(osd_calls), 1)
+            name, text, duration = osd_calls[0]
+            self.assertEqual(name, "show_osd_text")
+            self.assertIn("CH 01", text)
+            self.assertEqual(duration, int(app.config.osd_duration * 1000))  # 2500
+
+    def test_eof_retune_does_not_flash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)  # a=100, b=200, loop=300
+            clock = FakeClock(150.0)  # position 150 -> b@50
+            present = {"present": True}
+            app, player = self._app(mount, clock, present)
+            app.start()
+            app.step()  # initial tune -> flash
+            self.assertEqual(len(self._osd_calls(player)), 1)
+            player.calls.clear()
+            clock.t = 350.0  # since_load = 200 >= _UNPLAYABLE_TIMEOUT -> EOF
+            player._idle = True
+            app.step()  # same-channel rollover: retune, no flash
+            self.assertEqual(
+                [c for c in player.calls if c[0] == "show_osd_text"], []
+            )
+            self.assertEqual(
+                player.loaded[-1], (mount / "channels/01-cartoons/a.mp4", 50.0)
+            )
+
+    def test_unplayable_skip_does_not_flash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock(10.0)  # position 10 -> a@10
+            present = {"present": True}
+            app, player = self._app(mount, clock, present)
+            app.start()
+            app.step()  # tune a@10 -> flash
+            self.assertEqual(len(self._osd_calls(player)), 1)
+            player.calls.clear()
+            clock.advance(1.0)  # now=11, since_load=1 < 2 -> unplayable
+            player._idle = True
+            app.step()  # skip a, retune -> no flash
+            self.assertEqual(
+                [c for c in player.calls if c[0] == "show_osd_text"], []
+            )
+            self.assertIn(mount / "channels/01-cartoons/a.mp4", app._skip)
+
+    def test_info_toggles_overlay_in_playing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock(150.0)
+            present = {"present": True}
+            app, player = self._app(mount, clock, present)
+            app.start()
             app.step()
-            self.assertEqual(app.status()["state"], "playing")
-            self.assertEqual(app.status()["channel"], 1)
-            self.assertEqual(app.status()["file"], "b.mp4")
+            player.calls.clear()
+            app.handle(Command.INFO)
+            self.assertTrue(app.status()["overlay"])
+            shown = [c for c in player.calls if c[0] == "show_osd_text"]
+            self.assertEqual(len(shown), 1)
+            self.assertIn("CH 01", shown[0][1])
+            self.assertIn("Cartoons", shown[0][1])
+            self.assertIn("b", shown[0][1])  # title from filename
+            self.assertIn("remaining", shown[0][1])
+            # Second INFO dismisses it.
+            player.calls.clear()
+            app.handle(Command.INFO)
+            self.assertFalse(app.status()["overlay"])
+            self.assertIn(("clear_osd",), player.calls)
+
+    def test_back_dismisses_and_noop_when_not_shown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock(150.0)
+            present = {"present": True}
+            app, player = self._app(mount, clock, present)
+            app.start()
+            app.step()
+            # BACK with nothing shown: no player calls.
+            player.calls.clear()
+            app.handle(Command.BACK)
+            self.assertEqual(self._osd_calls(player), [])
+            # Show, then BACK dismisses.
+            app.handle(Command.INFO)
+            player.calls.clear()
+            app.handle(Command.BACK)
+            self.assertFalse(app.status()["overlay"])
+            self.assertIn(("clear_osd",), player.calls)
+
+    def test_info_back_ignored_in_no_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = Path(tmp)
+            (mount / "channels").mkdir()
+            clock = FakeClock()
+            present = {"present": False}
+            app, player = self._app(mount, clock, present)
+            app.start()
+            player.calls.clear()
+            app.handle(Command.INFO)
+            app.handle(Command.BACK)
+            self.assertEqual(self._osd_calls(player), [])
+            self.assertFalse(app.status()["overlay"])
+
+    def test_zap_with_overlay_up_refreshes_to_new_channel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = self._gap_mount(tmp, {
+                "01-cartoons": {"a.mp4": 100.0},
+                "03-sports": {"b.mp4": 100.0},
+            })
+            clock = FakeClock(10.0)
+            present = {"present": True}
+            app, player = self._app(mount, clock, present)
+            app.start()
+            app.step()  # channel 1
+            app.handle(Command.INFO)
+            self.assertTrue(app.status()["overlay"])
+            player.calls.clear()
+            app.handle(Command.CHANNEL_UP)  # -> channel 3
+            self.assertEqual(app.status()["channel"], 3)
+            self.assertTrue(app.status()["overlay"])  # not dismissed
+            shown = [c for c in player.calls if c[0] == "show_osd_text"]
+            self.assertEqual(len(shown), 1)
+            self.assertIn("CH 03", shown[0][1])
+            self.assertIn("b.mp4".replace(".mp4", ""), shown[0][1])  # new title
+
+    def test_standby_dismisses_overlay_and_wake_does_not_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock(150.0)
+            present = {"present": True}
+            app, player = self._app(mount, clock, present)
+            app.start()
+            app.step()
+            app.handle(Command.INFO)
+            self.assertTrue(app.status()["overlay"])
+            player.calls.clear()
+            app.handle(Command.POWER)  # standby
+            self.assertFalse(app.status()["overlay"])
+            self.assertIn(("clear_osd",), player.calls)
+            app.handle(Command.POWER)  # wake
+            self.assertFalse(app.status()["overlay"])
+            self.assertFalse(app.status()["standby"])
+
+    def test_overlay_remaining_rerender_throttled_to_once_per_second(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)  # a=100, b=200
+            clock = FakeClock(150.0)
+            present = {"present": True}
+            app, player = self._app(mount, clock, present)
+            app.start()
+            app.step()  # tune b@50
+            app.handle(Command.INFO)
+            app._flash_until = 0.0  # isolate the remaining-line re-renders
+            player.calls.clear()
+            # Two steps within 1 s: no re-render.
+            clock.advance(0.1)
+            app.step()
+            clock.advance(0.2)
+            app.step()
+            self.assertEqual(self._osd_calls(player), [])
+            # Cross the 1 s boundary: exactly one re-render.
+            clock.advance(1.0)
+            app.step()
+            self.assertEqual(len(self._osd_calls(player)), 1)
+            # The remaining line moved: 150s at show (t=150), now t=151.3,
+            # so 200 - (50 + 1.3) = 148s.
+            self.assertIn("2m 28s remaining", self._osd_calls(player)[0][1])
+
+    def test_entering_no_signal_clears_overlay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock(150.0)
+            present = {"present": True}
+            app, player = self._app(mount, clock, present)
+            app.start()
+            app.step()
+            app.handle(Command.INFO)
+            self.assertTrue(app.status()["overlay"])
+            player.calls.clear()
+            present["present"] = False
+            app.step()
+            self.assertEqual(app._mode, "NO_SIGNAL")
+            self.assertFalse(app.status()["overlay"])
+            self.assertIn(("clear_osd",), player.calls)
 
 
 if __name__ == "__main__":

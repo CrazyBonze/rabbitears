@@ -123,6 +123,12 @@ def load_config(path: Path = _DEFAULT_CONFIG_PATH) -> Config:
     repeat_interval = _as_float(data.get("repeat_interval"), _DEFAULTS.repeat_interval)
     if repeat_interval < 0.1:
         repeat_interval = _DEFAULTS.repeat_interval
+    osd_duration = _as_float(data.get("osd_duration"), _DEFAULTS.osd_duration)
+    if osd_duration <= 0:
+        osd_duration = _DEFAULTS.osd_duration
+    osd_font_size = _as_int(data.get("osd_font_size"), _DEFAULTS.osd_font_size)
+    if osd_font_size < 8:
+        osd_font_size = _DEFAULTS.osd_font_size
 
     return Config(
         epoch=_as_float(data.get("epoch"), _DEFAULTS.epoch),
@@ -133,8 +139,8 @@ def load_config(path: Path = _DEFAULT_CONFIG_PATH) -> Config:
         remote_vendor=_as_int(data.get("remote_vendor"), _DEFAULTS.remote_vendor),
         control_socket=_as_path(data.get("control_socket"), _DEFAULTS.control_socket),
         osd_color=_as_str(data.get("osd_color"), _DEFAULTS.osd_color),
-        osd_duration=_as_float(data.get("osd_duration"), _DEFAULTS.osd_duration),
-        osd_font_size=_as_int(data.get("osd_font_size"), _DEFAULTS.osd_font_size),
+        osd_duration=osd_duration,
+        osd_font_size=osd_font_size,
         socket_path=_as_path(data.get("socket_path"), _DEFAULTS.socket_path),
         buttons_path=_as_path(data.get("buttons_path"), _DEFAULTS.buttons_path),
         mount_point=_as_path(data.get("mount_point"), _DEFAULTS.mount_point),

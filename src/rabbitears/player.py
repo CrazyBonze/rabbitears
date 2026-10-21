@@ -221,9 +221,23 @@ class Player:
         """Enable or disable mute."""
         self._send(["set_property", "mute", bool(muted)])
 
-    def set_pause(self, paused: bool) -> None:
-        """Pause or resume playback (used for the info overlay / guide)."""
-        self._send(["set_property", "pause", bool(paused)])
+    def show_osd_text(self, text: str, duration_ms: int) -> None:
+        """Show ``text`` on the OSD (mpv ``show-text``).
+
+        ``duration_ms > 0``: the text clears itself after that many
+        milliseconds (the channel flash). ``duration_ms <= 0``: the text stays
+        until the next ``show-text``/``clear_osd`` (the info overlay). ``text``
+        may contain ASS override tags (``{\\an9}``, ``{\\fs72}``, ...), which
+        mpv's libass applies. Verified against mpv 0.41 (Alpine 3.24) in the VM.
+        """
+        if duration_ms > 0:
+            self._send(["show-text", text, duration_ms])
+        else:
+            self._send(["show-text", text])
+
+    def clear_osd(self) -> None:
+        """Remove any OSD text now showing (an empty ``show-text`` clears it)."""
+        self._send(["show-text", ""])
 
     def hide_video(self) -> None:
         """Hide video (standby): mpv keeps running, screen goes black."""

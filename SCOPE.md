@@ -316,7 +316,7 @@ rabbitears/
 - [ ] **M3 — Remote.** evdev input with up/down/OK/back/vol/mute/power working,
       plus hold-to-repeat, standby/wake, the control socket, and the power-key
       override.
-- [ ] **M4 — OSD.** Green channel flash and the info overlay (OK/Back).
+- [x] **M4 — OSD.** Green channel flash and the info overlay (OK/Back).
 - [ ] **M5 — Appliance hardening.** OpenRC respawn, NO SIGNAL screen, USB
       hot-plug, unplayable-file skip, pull-the-plug tests (×20).
 - [ ] **M6 — Reproducibility.** Box B rebuilt from repo + `apkovl`, identical to A.
@@ -329,6 +329,12 @@ rabbitears/
 ## 9. Parking lot (post-v1, not committed)
 
 Ideas we want eventually but will **not** start before v1.0:
+- **Icons — Pixelarticons first.** When we need on-screen icons (volume/mute/
+  standby indicators, a channel guide, anything visual beyond text),
+  [Pixelarticons](https://pixelarticons.com) is the first choice, tried before
+  anything else (MIT-licensed free tier, 24×24 pixel grid). The OSD is text-only
+  today and libass renders fonts, not SVGs, so this waits for the first icon
+  surface.
 - Channel guide on Home, using `KEY_HOMEPAGE` / `KEY_DELETE`
 - LAN web UI (Flask) for status, manual tuning, and content upload
 - Time-of-day programming blocks (mornings differ from evenings)
@@ -364,6 +370,13 @@ Ideas we want eventually but will **not** start before v1.0:
 | 2026-10-20 | Local root-only control socket for tests/automation; commands + status only, no network | A scripted, read-only probe over SSH (`rabbitears.ctl`); nothing that isn't a `Command` or a read-only `status` |
 | 2026-10-20 | Neither the remote nor the ACPI power button shuts the box down | busybox acpid PWRF/PWRB hooks make both a logged no-op; the app's KEY_POWER is standby; recovery from anything is pulling the plug |
 | 2026-10-20 | QEMU `usb-kbd` (vendor 0x0627) stands in for the remote in the VM | The app's real vendor scan finds it with no VM branch |
+| 2026-10-20 | OSD is mpv `show-text` with ASS override tags, not a separate overlay | One renderer, no second window/compositor; the flash and overlay are just styled text over the video |
+| 2026-10-20 | ASS tags are unescaped with the byte `\u0092` + `"a0"`, not the literal `${osd-ass-cc/0}` | mpv 0.41's `show-text` escapes `{…}` by default; the unescape marker is what the `osd-ass-cc/0` property *expands to*, and only that byte sequence turns the tags back on |
+| 2026-10-20 | `font-dejavu` for the OSD, not `font-terminus` | terminus is a bitmap font with 12–32 px faces only and renders nothing at the OSD's 72 px; DejaVu is a scalable outline font |
+| 2026-10-20 | Flash and overlay are separate `\n` lines in one `show-text` payload | ASS anchors (`\an`) position *lines*, not inline spans, so the top-right flash and the centred overlay can't share a line |
+| 2026-10-20 | `e2e-remote` sends a press *and* a release (a tap) for every button | The app's `KeyRepeater` repeats a held channel key until its release arrives; a bare press repeats forever and re-tunes every 0.4 s, corrupting later e2e checks |
+| 2026-10-20 | Channel flash fires on *arrivals* only (initial tune, zap, standby wake), not same-channel rollovers (EOF / unplayable skip) | A `CH NN` pop at every episode boundary is the noise §9's "Up Next" cards were deferred to avoid; rollovers still refresh an open overlay's title/remaining |
+| 2026-10-20 | Bundled `VCR OSD Mono` is the OSD face (supersedes `font-dejavu`, which stays as the fallback) | A VCR/CRT-style monospace that matches the "cable box" look and scales at 72 px (unlike bitmap `font-terminus`); DejaVu covers glyphs VCR OSD Mono lacks |
 
 ## 11. Open questions
 - 8GB or 16GB eMMC on each unit? (Affects apk cache headroom.)

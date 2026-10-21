@@ -180,7 +180,11 @@ for _dev in /dev/sd*; do
   MDEV="$_name" ACTION=add /etc/rabbitears/mdev-usb
 done
 
-# TODO: system/fonts/       — bundled pixel font + license (replaces font-terminus).
+# The bundled OSD font (VCR OSD Mono, SCOPE §4.5). A dedicated subdir keeps the
+# lbu include scoped (not the whole /usr/share/fonts, which also holds the
+# font-dejavu package); fontconfig scans subdirs, so it's still found.
+install_file "${REPO_ROOT}/system/fonts/VCR_OSD_Mono.ttf" /usr/share/fonts/rabbitears/VCR_OSD_Mono.ttf 0644
+fc-cache -f >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # 4. App code: atomic swap into /opt/rabbitears.
@@ -278,6 +282,7 @@ _lbu_include() {
 }
 _lbu_include /opt/rabbitears
 _lbu_include /usr/share/rabbitears
+_lbu_include /usr/share/fonts/rabbitears
 
 # ---------------------------------------------------------------------------
 # 8. LBU coverage check: every manifest path outside /etc must be under

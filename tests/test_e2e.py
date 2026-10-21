@@ -154,8 +154,9 @@ class DriverTest(unittest.TestCase):
 
     STEPS = ["preflight", "boot", "ssh", "deploy", "service", "mount", "playing",
              "schedule", "motion", "remote-power-off", "remote-power-on", "remote-zap",
-             "remote-autofire", "remote-volume", "unplug", "replug",
-             "crash", "verify"]
+             "remote-autofire", "remote-volume", "osd-flash", "osd-overlay",
+             "osd-overlay-zap", "osd-overlay-standby", "osd-remaining", "unplug",
+             "replug", "crash", "verify"]
 
     def _run(self, fail=(), **argv_overrides):
         with tempfile.TemporaryDirectory() as tmp:

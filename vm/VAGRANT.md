@@ -77,7 +77,12 @@ result from the outside. Each step prints `PASS`/`FAIL` with evidence:
 | playing, schedule | mpv plays a stick file; file + `time-pos` match `(now − epoch) mod loop` within ±3 s, computed on the host from `index.json` |
 | motion | two screendumps 3 s apart differ and aren't black |
 | remote power-off/on | `e2e-remote.py power` → NO SIGNAL, then `power` → playing again |
-| remote zap, autofire, volume, guide | `e2e-remote.py` drives the button FIFO: `channel-up` re-tunes, a 1.5 s `hold` autofires, `vol-up` raises mpv volume, `ok` shows then dismisses the guide (mpv pause) |
+| remote zap, autofire, volume | `e2e-remote.py` drives the button FIFO: `channel-up` re-tunes, a 1.5 s `hold` autofires, `vol-up` raises mpv volume |
+| osd flash | a zap puts green `CH NN` in the top-right (green pixels above a pre-zap baseline); it's gone ~3 s later |
+| osd overlay | `ok` → `ctl status` `overlay: true` + a screenshot; `back` → `false`; `ok` twice toggles on/off |
+| osd overlay + zap | with the overlay up, a zap keeps `overlay: true` and re-tunes |
+| osd overlay + standby | with the overlay up, `power` → `standby: true, overlay: false`; wake stays off |
+| osd remaining | `ctl status` `remaining` ≈ file duration − `time-pos`, within a few seconds |
 | unplug | QMP unplug → lazy unmount, mpv on the NO SIGNAL card, log line |
 | replug | QMP plug → remount, playing again at the schedule position |
 | crash | `pkill -9 mpv` → respawned and playing |
@@ -225,6 +230,24 @@ uv run task usb-plug         # -> vmctl.py usb plug     (re-insert it)
 `usb-build` is idempotent: a second run with no content changes copies nothing
 and does not reformat. Pass `--reformat` to rebuild a corrupt image, or
 `--reset-state` to drop the on-drive `/.rabbitears/` (index + state).
+
+---
+
+## On-screen display
+
+The channel flash and the info overlay are text over the live video (mpv
+`show-text` + ASS override tags, SCOPE §4.5/§10). In the VM:
+
+```sh
+uv run task vm-key ok     # show the info overlay (channel, title, time remaining)
+uv run task vm-key back   # dismiss it
+uv run task vm-shot       # the overlay is centred; a flash is top-right right after a zap
+```
+
+The flash (`CH NN`, green, top-right) fires on every tune and clears itself
+after ~2.5 s, so `vm-shot` right after a `vm-key up`/`down` catches it. The
+overlay is centred and stays until `back`. Legibility over composite on the CRT
+is a real-3040 check (SCOPE §7.3); the VM screenshot is the pixel evidence.
 
 ---
 

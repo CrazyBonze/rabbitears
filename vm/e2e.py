@@ -16,11 +16,16 @@ manual step inside the VM:
    8. playing       mpv plays a file from the stick
    9. schedule      mpv's file + time-pos match (now - epoch) mod loop (±3s)
   10. motion        two screenshots 3s apart differ (real video on screen)
-  11. unplug        usb unplug -> lazy unmount, mpv shows the NO SIGNAL card
-  12. replug        usb plug -> remount, playback at the schedule position
-  13. crash         pkill -9 mpv -> supervise-daemon respawns, playback returns
-  14. verify        alpine/verify.sh --vm still reports OK (tests drifted nothing)
-  15. shutdown      the VM stops and no QEMU is left holding the disk
+  11. osd-flash     zap -> green CH NN top-right, gone after osd_duration
+  12. osd-overlay   ok -> overlay on (ctl status + screenshot), back -> off
+  13. osd-zap       zap with the overlay up -> refreshed, not dismissed
+  14. osd-standby   power with the overlay up -> dismissed, wake doesn't restore
+  15. osd-remaining ctl status 'remaining' matches mpv's time-pos (±3s)
+  16. unplug        usb unplug -> lazy unmount, mpv shows the NO SIGNAL card
+  17. replug        usb plug -> remount, playback at the schedule position
+  18. crash         pkill -9 mpv -> supervise-daemon respawns, playback returns
+  19. verify        alpine/verify.sh --vm still reports OK (tests drifted nothing)
+  20. shutdown      the VM stops and no QEMU is left holding the disk
 
 Every check prints PASS/FAIL with evidence; a JSON report, serial log, deploy
 log and screenshots go to the run directory (default /tmp/rabbitears-e2e).
@@ -161,9 +166,15 @@ def is_no_signal(probe: dict) -> bool:
 
 
 def is_standby(probe: dict) -> bool:
-    """True if the app is in standby: video hidden (vid=no) and muted."""
+    """True if the app is in standby: video hidden and muted.
+
+    mpv 0.41 reports `vid` as `false`/`0` while a file is playing with the
+    video track deselected (`vid=no`), and as the string `"no"` when idle.
+    (The old `== "no"`-only check passed only when the file hit EOF during
+    the poll window — a race.)
+    """
     mpv = probe.get("mpv") or {}
-    return mpv.get("vid") == "no" and bool(mpv.get("mute"))
+    return mpv.get("vid") in ("no", 0) and bool(mpv.get("mute"))
 
 
 def mpv_volume(probe: dict) -> float | None:
@@ -219,6 +230,24 @@ def is_blank(rgb: bytes, stride: int = 7, threshold: int = 16) -> bool:
     """True if (almost) every sampled byte is near black."""
     sample = rgb[::stride]
     return sum(1 for v in sample if v > threshold) < len(sample) * 0.002
+
+
+def flash_green_count(rgb: bytes, w: int, h: int, tol: int = 15, stride: int = 2) -> int:
+    """Count pixels near the OSD green #33CC33 in the top-right region.
+
+    The channel flash is exactly #33CC33 (51, 204, 51). The mock video's
+    colour bars sweep through green shades (including (51, 204, 51) itself),
+    so a tight tolerance keeps the count on the text core, and the check
+    compares against a baseline screenshot taken just before the zap.
+    """
+    n = 0
+    for y in range(0, int(h * 0.35), stride):
+        for x in range(int(w * 0.6), w, stride):
+            i = (y * w + x) * 3
+            r, g, b = rgb[i], rgb[i + 1], rgb[i + 2]
+            if abs(r - 51) < tol and abs(g - 204) < tol and abs(b - 51) < tol:
+                n += 1
+    return n
 
 
 # --- Plumbing -------------------------------------------------------------------
@@ -386,6 +415,21 @@ class E2E:
         r = self.target.ssh(f"tail -n {lines} /var/log/rabbitears.log")
         return r.stdout
 
+    def _ctl_status(self) -> dict:
+        """The app's read-only status over the control socket (via SSH).
+
+        -B: never write __pycache__ into /opt/rabbitears (verify.sh flags
+        unmanaged files there; the service itself runs with
+        PYTHONDONTWRITEBYTECODE=1).
+        """
+        r = self.target.ssh("PYTHONPATH=/opt python3 -B -m rabbitears.ctl status")
+        if r.returncode != 0:
+            raise CheckFailed(f"ctl status failed: {r.stderr.strip()}")
+        try:
+            return json.loads(r.stdout.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError) as e:
+            raise CheckFailed(f"ctl status returned bad JSON: {r.stdout[-200:]!r}") from e
+
     # -- checks --
 
     def c_preflight(self) -> str:
@@ -550,7 +594,12 @@ class E2E:
         return f"autofire (hold 1500ms) -> playing {mpv_path(probe)} ({zaps} remote log lines)"
 
     def c_remote_volume(self) -> str:
-        before = mpv_volume(self.target.probe())
+        # The volume persists on the stick's state.json across runs, so a prior
+        # run can leave it at the cap (80), where vol-up can't increase it. Step
+        # it down first (and wait for the drop) so the increase below is real.
+        self._remote("vol-down")
+        probe = self._probe_until(lambda p: (mpv_volume(p) or 0) < 80, 10)
+        before = mpv_volume(probe)
         r = self._remote("vol-up")
         if r.returncode != 0:
             raise CheckFailed(f"e2e-remote vol-up failed: {r.stderr.strip()}")
@@ -559,6 +608,128 @@ class E2E:
         if before is None or after is None or after <= before:
             raise CheckFailed(f"volume did not increase: before={before} after={after}")
         return f"vol-up: {before} -> {after}"
+
+    # -- on-screen display checks (M4: flash + info overlay) ---------------
+
+    def _overlay_ensure(self, on: bool) -> None:
+        """Drive the overlay to a known state (ok toggles it)."""
+        if bool(self._ctl_status().get("overlay")) != on:
+            self._remote("ok")
+
+    def c_osd_flash(self) -> str:
+        # Clean slate: a zap in an earlier check can leave its flash on screen
+        # (osd_duration is 2.5s and the checks run back-to-back).
+        time.sleep(3.0)
+        # Baseline first: the mock video's colours cycle, so the top-right can
+        # contain #33CC33-ish green on its own. The flash is detected as the
+        # increase over this baseline.
+        w, h, base = self._screenshot("osd-flash-base")
+        base_n = flash_green_count(base, w, h)
+        r = self._remote("channel-up")
+        if r.returncode != 0:
+            raise CheckFailed(f"e2e-remote channel-up failed: {r.stderr.strip()}")
+        # The flash is up for osd_duration (2.5s) from the tune. In the VM the
+        # tune can land up to ~1.5s after the button: the app's step loop is
+        # single-threaded, and a state.json fsync over the emulated exFAT USB
+        # can block it for a second (real 3040 USB is fast). So take up to
+        # five screenshots over 3.2s and keep the greenest.
+        best = 0
+        for i in range(5):
+            w, h, rgb = self._screenshot(f"osd-flash-on-{i}")
+            best = max(best, flash_green_count(rgb, w, h) - base_n)
+            if best > 1000:
+                break
+            time.sleep(0.8)
+        if best <= 1000:
+            raise CheckFailed(f"no green flash in the top-right after a zap "
+                              f"(best {best} px above baseline {base_n})")
+        time.sleep(3.0)  # longer than osd_duration (2.5s)
+        w2, h2, rgb2 = self._screenshot("osd-flash-off")
+        off = flash_green_count(rgb2, w2, h2) - base_n
+        if off > 500:
+            raise CheckFailed(f"flash still visible 3s after the zap "
+                              f"({off} px above baseline vs {best} on)")
+        return f"flash on: {best} px near #33CC33 above baseline; off after 3s: " \
+               f"{off} px (osd-flash-on-*.png, osd-flash-off.png)"
+
+    def c_osd_overlay(self) -> str:
+        r = self._remote("ok")
+        if r.returncode != 0:
+            raise CheckFailed(f"e2e-remote ok failed: {r.stderr.strip()}")
+        st = self._ctl_status()
+        if not st.get("overlay"):
+            raise CheckFailed(f"overlay not shown after ok: {st}")
+        w, h, _ = self._screenshot("osd-overlay-on")
+        r = self._remote("back")
+        if r.returncode != 0:
+            raise CheckFailed(f"e2e-remote back failed: {r.stderr.strip()}")
+        st = self._ctl_status()
+        if st.get("overlay"):
+            raise CheckFailed(f"overlay still shown after back: {st}")
+        w2, h2, _ = self._screenshot("osd-overlay-off")
+        # ok twice: toggles on then off.
+        self._remote("ok")
+        if not self._ctl_status().get("overlay"):
+            raise CheckFailed("second ok did not show the overlay")
+        self._remote("ok")
+        if self._ctl_status().get("overlay"):
+            raise CheckFailed("third ok did not dismiss the overlay")
+        return f"ok -> overlay on, back -> off, ok ok -> on/off ({w}x{h} " \
+               f"osd-overlay-on/off.png)"
+
+    def c_osd_overlay_zap(self) -> str:
+        self._overlay_ensure(True)
+        r = self._remote("channel-up")
+        if r.returncode != 0:
+            raise CheckFailed(f"e2e-remote channel-up failed: {r.stderr.strip()}")
+        st = self._probe_until(lambda p: is_playing_media(p), 30)
+        st = self._ctl_status()
+        if not st.get("overlay"):
+            raise CheckFailed(f"zap dismissed the overlay: {st}")
+        if st.get("state") != "playing":
+            raise CheckFailed(f"not playing after zap with overlay up: {st}")
+        w, h, _ = self._screenshot("osd-overlay-zap")
+        return f"zap with overlay up -> still on, playing {st.get('file')} " \
+               f"(osd-overlay-zap.png)"
+
+    def c_osd_overlay_standby(self) -> str:
+        self._overlay_ensure(True)
+        r = self._remote("power")
+        if r.returncode != 0:
+            raise CheckFailed(f"e2e-remote power failed: {r.stderr.strip()}")
+        probe = self._probe_until(is_standby, 10)
+        st = self._ctl_status()
+        if not is_standby(probe) or st.get("overlay"):
+            raise CheckFailed(f"standby did not dismiss the overlay: "
+                              f"{st}, mpv {probe.get('mpv')!r}")
+        r = self._remote("power")
+        if r.returncode != 0:
+            raise CheckFailed(f"e2e-remote power failed: {r.stderr.strip()}")
+        self._probe_until(lambda p: is_playing_media(p) and not is_standby(p), 30)
+        st = self._ctl_status()
+        if st.get("overlay") or st.get("standby"):
+            raise CheckFailed(f"wake restored the overlay: {st}")
+        return "power with overlay up -> standby + overlay off; wake -> stays off"
+
+    def c_osd_remaining(self) -> str:
+        st = self._ctl_status()
+        remaining = st.get("remaining")
+        if remaining is None:
+            raise CheckFailed(f"no 'remaining' in ctl status: {st}")
+        probe = self.target.probe()
+        time_pos = (probe.get("mpv") or {}).get("time-pos")
+        files = probe.get("files") or []
+        name = os.path.basename(mpv_path(probe) or "")
+        duration = next((d for n, d in files if n == name), None)
+        if not isinstance(time_pos, (int, float)) or duration is None:
+            raise CheckFailed(f"not enough probe data: time-pos={time_pos!r}, "
+                              f"duration={duration!r}")
+        expected = duration - time_pos
+        if abs(remaining - expected) > SCHEDULE_TOLERANCE:
+            raise CheckFailed(f"remaining {remaining:.1f}s vs expected "
+                              f"{expected:.1f}s (duration {duration:.1f}s, "
+                              f"time-pos {time_pos:.1f}s)")
+        return f"remaining {remaining:.1f}s ≈ duration - time-pos ({expected:.1f}s)"
 
     def c_unplug(self) -> str:
         r = self._vmctl("usb", "unplug", "--monitor", self.args.monitor)
@@ -668,6 +839,11 @@ class E2E:
             ("remote-zap", self.c_remote_zap),
             ("remote-autofire", self.c_remote_autofire),
             ("remote-volume", self.c_remote_volume),
+            ("osd-flash", self.c_osd_flash),
+            ("osd-overlay", self.c_osd_overlay),
+            ("osd-overlay-zap", self.c_osd_overlay_zap),
+            ("osd-overlay-standby", self.c_osd_overlay_standby),
+            ("osd-remaining", self.c_osd_remaining),
             ("unplug", self.c_unplug),
             ("replug", self.c_replug),
         ]

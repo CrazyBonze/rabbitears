@@ -6,7 +6,11 @@ script (deployed to the VM and run over SSH). It writes the same wire format the
 evdev daemon does (SCOPE §4.4): one line per button event — a press is the button
 name, a release is the name with a trailing "~".
 
-    e2e-remote <button>            write one press
+    e2e-remote <button>            write a tap: a press, then a release 50 ms
+                                   later (like a real remote; the app's
+                                   KeyRepeater repeats a held channel key until
+                                   its release arrives, so a bare press would
+                                   repeat forever and interfere with later checks)
     e2e-remote hold <button> <ms>  write a press, wait <ms>, then a release
                                    (exercises the app's autofire)
 
@@ -32,7 +36,8 @@ def main(argv: list[str]) -> int:
             return 2
         button, ms = argv[1], int(argv[2])
     else:
-        button, ms = argv[0], 0
+        # A tap: press + release 50 ms apart (see the usage above).
+        button, ms = argv[0], 50
 
     try:
         fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)

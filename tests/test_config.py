@@ -169,5 +169,43 @@ class NewKeyDefaultsTest(unittest.TestCase):
             self.assertEqual(cfg.remote_vendor, 0x0627)
 
 
+class OsdRangeChecksTest(unittest.TestCase):
+    def test_osd_duration_valid_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("osd_duration = 4.0\nosd_font_size = 48\n")
+            cfg = load_config(path)
+            self.assertEqual(cfg.osd_duration, 4.0)
+            self.assertEqual(cfg.osd_font_size, 48)
+
+    def test_osd_duration_zero_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("osd_duration = 0\nosd_font_size = 48\n")
+            cfg = load_config(path)
+            self.assertEqual(cfg.osd_duration, 2.5)  # default
+            self.assertEqual(cfg.osd_font_size, 48)  # preserved
+
+    def test_osd_duration_negative_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("osd_duration = -1.5\n")
+            self.assertEqual(load_config(path).osd_duration, 2.5)
+
+    def test_osd_font_size_below_eight_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("osd_font_size = 4\nosd_duration = 4.0\n")
+            cfg = load_config(path)
+            self.assertEqual(cfg.osd_font_size, 72)  # default
+            self.assertEqual(cfg.osd_duration, 4.0)  # preserved
+
+    def test_osd_font_size_eight_is_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("osd_font_size = 8\n")
+            self.assertEqual(load_config(path).osd_font_size, 8)
+
+
 if __name__ == "__main__":
     unittest.main()

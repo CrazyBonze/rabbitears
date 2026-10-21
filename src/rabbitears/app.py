@@ -31,6 +31,7 @@ from typing import Protocol
 
 from . import channels as channels_mod
 from . import index as index_mod
+from . import osd as osd_mod
 from . import schedule as schedule_mod
 from . import state as state_mod
 from .channels import Channel
@@ -65,6 +66,8 @@ class PlayerLike(Protocol):
     def load(self, path: Path, offset: float = 0.0) -> None: ...
     def hide_video(self) -> None: ...
     def show_video(self) -> None: ...
+    def show_osd_text(self, text: str, duration_ms: int) -> None: ...
+    def clear_osd(self) -> None: ...
     def is_idle(self) -> bool: ...
     def is_running(self) -> bool: ...
     def stop(self) -> None: ...
@@ -175,6 +178,12 @@ class App:
         self._muted = False
         self._standby = False
         self._pre_standby_muted = False
+        # Info overlay (SCOPE §4.5): shown? + the last time the remaining line
+        # was re-rendered (throttled to ~1/s). _flash_until is the deadline of
+        # the current channel flash (0 = none).
+        self._overlay_shown = False
+        self._overlay_updated_at = 0.0
+        self._flash_until = 0.0
         # Remote input (SCOPE §4.4): the app is the FIFO reader and the only
         # process that acts on a button. Disabled if the FIFO can't be opened.
         self._buttons_fd: int | None = None
@@ -324,13 +333,14 @@ class App:
             _log.warning("media removed — NO SIGNAL")
             self._enter_no_signal()
             return
+        self._step_osd(now)
         if self.player.is_idle():
             since_load = now - self._load_time
             if since_load < _UNPLAYABLE_TIMEOUT and not self._offset_near_end():
                 self._handle_unplayable()
                 return
             # Normal end-of-file: recompute from the clock (never a counter).
-            self._tune()
+            self._tune(flash=False)
 
     # -- command handling (the Part 1b state table) ------------------------
 
@@ -358,8 +368,19 @@ class App:
             self._volume(step if command is Command.VOLUME_UP else -step, source, command)
         elif command is Command.MUTE:
             self._mute(source)
-        else:  # INFO / BACK (M4): overlay isn't built yet.
-            _log.info("%s: %s ignored (overlay is M4)", source, command.value)
+        elif command is Command.INFO:
+            if self._mode != "PLAYING":
+                _log.info("%s: %s ignored (no signal)", source, command.value)
+                return
+            if self._overlay_shown:
+                self._dismiss_overlay(source, command)
+            else:
+                self._show_overlay(source)
+        else:  # BACK
+            if not self._overlay_shown:
+                _log.info("%s: %s ignored (nothing to dismiss)", source, command.value)
+                return
+            self._dismiss_overlay(source, command)
 
     def _power(self, source: str) -> None:
         """Toggle standby (SCOPE §4.6): hide video + mute; wake re-tunes."""
@@ -377,6 +398,7 @@ class App:
         else:
             self._standby = True
             self._pre_standby_muted = self._muted
+            self._clear_overlay("standby")
             self.player.hide_video()
             self.player.set_mute(True)
             _log.info("%s: power standby", source)
@@ -465,7 +487,7 @@ class App:
         self._playlist = durations
         self._tune()
 
-    def _tune(self) -> None:
+    def _tune(self, flash: bool = True) -> None:
         """Load the schedule-correct file at the schedule-correct offset."""
         assert self._current is not None and self._playlist
         ch = self._current
@@ -488,6 +510,121 @@ class App:
             channel_label(ch), path.name, int(offset // 60), int(offset % 60),
             position, loop,
         )
+        if flash:
+            self._flash(ch, now)
+        elif self._overlay_shown:
+            # Same-channel rollover (EOF/unplayable skip): no channel flash, but
+            # the overlay's title/remaining changed, so refresh it (SCOPE §4.5).
+            self._overlay_updated_at = now
+            self._render_overlay()
+
+    def _flash(self, ch: Channel, now: float) -> None:
+        """Channel flash (SCOPE §4.5): CH NN top-right for osd_duration seconds.
+
+        Called from ``_tune()`` only for channel arrivals (initial tune, zap,
+        standby wake); same-channel rollovers (EOF, unplayable skip) refresh
+        the overlay but do not flash. With the overlay up, the flash is
+        composed into the overlay payload (mpv's OSD message layer is a single
+        surface) and ``_step_osd`` re-sends the overlay-only payload when the
+        flash expires — the flash never wipes the overlay.
+        """
+        self._flash_until = now + self.config.osd_duration
+        if self._overlay_shown:
+            self._overlay_updated_at = now
+            self._render_overlay()
+        else:
+            self.player.show_osd_text(
+                osd_mod.flash_ass(
+                    osd_mod.channel_flash_text(ch.number),
+                    self.config.osd_color,
+                    self.config.osd_font_size,
+                ),
+                int(self.config.osd_duration * 1000),
+            )
+
+    # -- info overlay (SCOPE §4.5) ------------------------------------------
+
+    def _remaining_seconds(self) -> float | None:
+        """Seconds left in the current file, or None if nothing is loaded."""
+        if self._last_loaded_path is None:
+            return None
+        duration = 0.0
+        for path, dur in self._playlist:
+            if path == self._last_loaded_path:
+                duration = dur
+                break
+        return osd_mod.remaining_seconds(
+            duration, self._last_loaded_offset, self.clock() - self._load_time
+        )
+
+    def _overlay_text(self) -> str | None:
+        """The current overlay payload (ASS-styled), flash line included
+        while the flash is active; None if there is nothing to show.
+
+        The overlay is the "small panel" (SCOPE §4.5): half the flash's font
+        size, so three lines fit on screen.
+        """
+        ch = self._current
+        if ch is None or self._last_loaded_path is None:
+            return None
+        remaining = self._remaining_seconds()
+        title = osd_mod.show_title(self._last_loaded_path)
+        remaining_str = osd_mod.format_remaining(
+            remaining if remaining is not None else 0.0
+        )
+        info_size = max(8, self.config.osd_font_size // 2)
+        if self._flash_until > self.clock():
+            return osd_mod.flash_over_info_ass(
+                ch.number, ch.name, title, remaining_str,
+                self.config.osd_color, self.config.osd_font_size, info_size,
+            )
+        return osd_mod.info_ass(
+            ch.number, ch.name, title, remaining_str,
+            self.config.osd_color, info_size,
+        )
+
+    def _render_overlay(self) -> None:
+        """(Re)send the overlay payload to mpv (persistent: duration 0)."""
+        text = self._overlay_text()
+        if text is not None:
+            self.player.show_osd_text(text, 0)
+
+    def _show_overlay(self, source: str) -> None:
+        self._overlay_shown = True
+        self._overlay_updated_at = self.clock()
+        self._render_overlay()
+        _log.info("%s: info -> overlay shown", source)
+
+    def _dismiss_overlay(self, source: str, command: Command) -> None:
+        self._overlay_shown = False
+        self._flash_until = 0.0
+        self.player.clear_osd()
+        _log.info("%s: %s -> overlay dismissed", source, command.value)
+
+    def _clear_overlay(self, reason: str) -> None:
+        """Drop the overlay/flash without a command (standby, NO SIGNAL)."""
+        if self._overlay_shown or self._flash_until:
+            self._overlay_shown = False
+            self._flash_until = 0.0
+            self.player.clear_osd()
+            _log.info("overlay dismissed (%s)", reason)
+
+    def _step_osd(self, now: float) -> None:
+        """Expire the flash and keep the overlay's remaining line fresh (~1/s).
+
+        The flash is a self-expiring ``show-text`` when the overlay is down;
+        when the overlay is up the flash lives inside the overlay payload, so
+        its expiry re-sends the overlay-only payload. The remaining line is
+        re-rendered at most once per second (not on every 10 Hz step).
+        """
+        if self._flash_until and now >= self._flash_until:
+            self._flash_until = 0.0
+            if self._overlay_shown:
+                self._overlay_updated_at = now
+                self._render_overlay()
+        if self._overlay_shown and now - self._overlay_updated_at >= 1.0:
+            self._overlay_updated_at = now
+            self._render_overlay()
 
     def _save_state(self) -> None:
         state_mod.save_state(
@@ -506,6 +643,8 @@ class App:
             "file": self._last_loaded_path.name if self._last_loaded_path is not None else None,
             "volume": self.state.volume,
             "muted": self._muted,
+            "overlay": self._overlay_shown,
+            "remaining": self._remaining_seconds(),
         }
 
     # -- unplayable-file handling ------------------------------------------
@@ -531,12 +670,13 @@ class App:
         if not self._playlist:
             self._enter_no_signal()
             return
-        self._tune()
+        self._tune(flash=False)
 
     # -- state transitions --------------------------------------------------
 
     def _enter_no_signal(self) -> None:
         self._mode = "NO_SIGNAL"
+        self._clear_overlay("no signal")
         self._current = None
         self._playlist = []
         self._last_loaded_path = None

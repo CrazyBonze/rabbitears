@@ -15,9 +15,12 @@ libva-utils           # provides `vainfo` (M1 verifies VAAPI)
 python3
 py3-evdev
 
-# --- Fonts: blocky pixel font for the OSD (SCOPE §3). A bundled font in
-#     system/fonts/ may replace this later. ---
-font-terminus
+# --- Fonts (SCOPE §3, §4.5). The OSD face is the bundled VCR OSD Mono
+#     (system/fonts/, installed to /usr/share/fonts/rabbitears/ by setup.sh);
+#     font-dejavu stays as the fontconfig fallback for glyphs it lacks (e.g.
+#     accented characters in filenames). font-terminus is out: it's a *bitmap*
+#     font (12-32px faces only) and renders nothing at the OSD's 72 px. ---
+font-dejavu
 
 # --- System services (SCOPE §3) ---
 openssh               # dev access

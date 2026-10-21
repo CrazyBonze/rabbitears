@@ -338,6 +338,69 @@ class LoadTest(unittest.TestCase):
                 fake.stop()
 
 
+class OsdTest(unittest.TestCase):
+    def test_show_osd_text_with_duration_sends_show_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sock_path = Path(tmp) / "mpv.sock"
+            fake = FakeMpv(sock_path)
+            fake.set_responses([{"error": "success", "request_id": 1}])
+            fake.start()
+            try:
+                player = Player(socket_path=sock_path)
+                player.show_osd_text("{\\an9}CH 03", 2500)
+                self.assertEqual(fake.received[0]["command"],
+                                 ["show-text", "{\\an9}CH 03", 2500])
+            finally:
+                fake.stop()
+
+    def test_show_osd_text_zero_duration_is_persistent(self):
+        """duration_ms <= 0 means 'until cleared': no duration argument."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sock_path = Path(tmp) / "mpv.sock"
+            fake = FakeMpv(sock_path)
+            fake.set_responses([{"error": "success", "request_id": 1}])
+            fake.start()
+            try:
+                player = Player(socket_path=sock_path)
+                player.show_osd_text("{\\an8}overlay", 0)
+                self.assertEqual(fake.received[0]["command"],
+                                 ["show-text", "{\\an8}overlay"])
+            finally:
+                fake.stop()
+
+    def test_clear_osd_sends_empty_show_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sock_path = Path(tmp) / "mpv.sock"
+            fake = FakeMpv(sock_path)
+            fake.set_responses([{"error": "success", "request_id": 1}])
+            fake.start()
+            try:
+                player = Player(socket_path=sock_path)
+                player.clear_osd()
+                self.assertEqual(fake.received[0]["command"], ["show-text", ""])
+            finally:
+                fake.stop()
+
+    def test_show_osd_text_raises_player_error_on_ipc_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sock_path = Path(tmp) / "mpv.sock"
+            fake = FakeMpv(sock_path)
+            fake.set_responses([{"error": "some other error", "request_id": 1}])
+            fake.start()
+            try:
+                player = Player(socket_path=sock_path)
+                with self.assertRaises(PlayerError):
+                    player.show_osd_text("CH 03", 2500)
+            finally:
+                fake.stop()
+
+    def test_clear_osd_raises_player_error_on_closed_socket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            player = Player(socket_path=Path(tmp) / "mpv.sock")
+            with self.assertRaises(PlayerError):
+                player.clear_osd()
+
+
 class StartTest(unittest.TestCase):
     def test_start_raises_timeout_if_socket_never_appears(self):
         with tempfile.TemporaryDirectory() as tmp:
