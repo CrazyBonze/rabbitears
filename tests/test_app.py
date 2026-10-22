@@ -630,7 +630,7 @@ class HandleTest(AppTestBase):
             self.assertEqual(app.status(), {
                 "state": "no_signal", "standby": False, "channel": None,
                 "channel_name": None, "file": None, "volume": 50, "muted": False,
-                "overlay": False, "remaining": None,
+                "overlay": False, "remaining": None, "sleep": None,
             })
             app.step()
             self.assertEqual(app.status()["state"], "playing")
@@ -994,6 +994,177 @@ class VolumeIndicatorTest(AppTestBase):
             self.assertIn(osd_mod.ICON_VOLUME, text)
             self.assertIn("CH 01", text)      # overlay still present
             self.assertIn("Cartoons", text)
+
+
+class SleepTimerTest(AppTestBase):
+    """The sleep-timer state machine (SCOPE §4.4 Sun).
+
+    States: OFF -> CHOOSER (Sun) -> [navigate Sun/Left/Right] -> ARMED (OK) ->
+    COUNTDOWN (last 60s) -> STANDBY (fire), with Back = cancel and Sun = extend.
+    """
+
+    def _booted(self, tmp: str) -> tuple[app_mod.App, FakePlayer, FakeClock]:
+        mount = _make_mount(tmp)
+        clock = FakeClock(150.0)
+        app, player = self._app(mount, clock, {"present": True})
+        app.start()
+        app.step()
+        self.assertEqual(app._mode, "PLAYING")
+        return app, player, clock
+
+    def _arm(self, app: app_mod.App, option: int) -> None:
+        """Open the chooser, move to `option` (preset index, or 3 = Off), commit."""
+        app.handle(Command.SLEEP)
+        while app._sleep_selection != option:
+            app.handle(Command.RIGHT)
+        app.handle(Command.INFO)
+
+    def test_sun_opens_chooser_at_first_preset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, _c = self._booted(tmp)
+            app.handle(Command.SLEEP)
+            self.assertTrue(app._sleep_chooser_open)
+            self.assertEqual(app._sleep_selection, 0)
+            self.assertIsNone(app._sleep_index)  # not armed yet
+
+    def test_chooser_cycles_and_wraps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, _c = self._booted(tmp)
+            app.handle(Command.SLEEP)
+            app.handle(Command.RIGHT)
+            self.assertEqual(app._sleep_selection, 1)
+            app.handle(Command.RIGHT)
+            app.handle(Command.RIGHT)
+            self.assertEqual(app._sleep_selection, 3)  # "Off"
+            app.handle(Command.RIGHT)
+            self.assertEqual(app._sleep_selection, 0)  # wraps
+            app.handle(Command.LEFT)
+            self.assertEqual(app._sleep_selection, 3)  # wraps back
+
+    def test_sun_advances_when_chooser_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, _c = self._booted(tmp)
+            app.handle(Command.SLEEP)
+            app.handle(Command.SLEEP)
+            self.assertEqual(app._sleep_selection, 1)
+
+    def test_ok_commits_preset_and_closes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, clock = self._booted(tmp)
+            self._arm(app, 0)
+            self.assertFalse(app._sleep_chooser_open)
+            self.assertEqual(app._sleep_index, 0)
+            self.assertAlmostEqual(app._sleep_until, clock.t + 30 * 60.0)
+
+    def test_ok_commits_off_disarms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, _c = self._booted(tmp)
+            self._arm(app, 3)  # "Off"
+            self.assertIsNone(app._sleep_index)
+            self.assertAlmostEqual(app._sleep_until, 0.0)
+
+    def test_back_closes_chooser_without_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, _c = self._booted(tmp)
+            app.handle(Command.SLEEP)
+            app.handle(Command.BACK)
+            self.assertFalse(app._sleep_chooser_open)
+            self.assertIsNone(app._sleep_index)
+
+    def test_chooser_auto_dismisses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, clock = self._booted(tmp)
+            app.handle(Command.SLEEP)
+            clock.advance(6.0)  # > sleep_chooser_duration (5s)
+            app.step()
+            self.assertFalse(app._sleep_chooser_open)
+            self.assertIsNone(app._sleep_index)
+
+    def test_countdown_appears_in_last_60s(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, player, clock = self._booted(tmp)
+            self._arm(app, 0)
+            clock.t = app._sleep_until - 60.0
+            app.step()
+            self.assertTrue(app._in_sleep_countdown(clock.t))
+            shown = [c[1] for c in player.calls if c[0] == "show_osd_text"]
+            self.assertTrue(shown and "Off in" in shown[-1])
+
+    def test_fire_enters_standby(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, player, clock = self._booted(tmp)
+            self._arm(app, 0)
+            clock.t = app._sleep_until
+            app.step()
+            self.assertTrue(app._standby)
+            self.assertIsNone(app._sleep_index)
+            self.assertIn(("hide_video",), player.calls)
+            self.assertIn(("set_mute", True), player.calls)
+
+    def test_back_cancels_during_countdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, clock = self._booted(tmp)
+            self._arm(app, 0)
+            clock.t = app._sleep_until - 30.0
+            app.handle(Command.BACK)
+            self.assertIsNone(app._sleep_index)
+            self.assertAlmostEqual(app._sleep_until, 0.0)
+            self.assertFalse(app._standby)
+
+    def test_extend_during_countdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, clock = self._booted(tmp)
+            self._arm(app, 0)  # 30m
+            clock.t = app._sleep_until - 30.0
+            old_until = app._sleep_until
+            app.handle(Command.SLEEP)  # reopen chooser at current (0)
+            self.assertTrue(app._sleep_chooser_open)
+            app.handle(Command.RIGHT)  # 60m
+            app.handle(Command.INFO)   # commit
+            self.assertEqual(app._sleep_index, 1)
+            self.assertAlmostEqual(app._sleep_until, clock.t + 60 * 60.0)
+            self.assertGreater(app._sleep_until, old_until)
+
+    def test_power_standby_clears_timer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, _c = self._booted(tmp)
+            self._arm(app, 0)
+            app.handle(Command.POWER)
+            self.assertTrue(app._standby)
+            self.assertIsNone(app._sleep_index)
+            self.assertAlmostEqual(app._sleep_until, 0.0)
+
+    def test_sleep_ignored_in_no_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = _make_mount(tmp)
+            clock = FakeClock(150.0)
+            app, _p = self._app(mount, clock, {"present": False})
+            app.start()
+            app.step()
+            self.assertEqual(app._mode, "NO_SIGNAL")
+            app.handle(Command.SLEEP)
+            self.assertFalse(app._sleep_chooser_open)
+
+    def test_sleep_ignored_in_standby(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, _c = self._booted(tmp)
+            app.handle(Command.POWER)
+            app.handle(Command.SLEEP)
+            self.assertFalse(app._sleep_chooser_open)
+
+    def test_arrows_ignored_without_chooser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, _c = self._booted(tmp)
+            app.handle(Command.LEFT)
+            app.handle(Command.RIGHT)
+            self.assertFalse(app._sleep_chooser_open)
+
+    def test_status_exposes_sleep_remaining(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _p, _c = self._booted(tmp)
+            self.assertIsNone(app.status()["sleep"])
+            self._arm(app, 0)
+            self.assertAlmostEqual(app.status()["sleep"], 30 * 60.0)
 
 
 if __name__ == "__main__":

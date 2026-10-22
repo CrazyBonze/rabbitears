@@ -155,5 +155,23 @@ class IconAssWrappersTest(unittest.TestCase):
         self.assertEqual(out, "{\\an9}A\n{\\an1}B")
 
 
+class SleepLineTest(unittest.TestCase):
+    def test_chooser_brackets_selected_option(self):
+        out = osd.sleep_chooser_line(["30m", "60m", "90m", "Off"], 1, "#33CC33", 36)
+        self.assertIn("[60m]", out)
+        self.assertNotIn("[30m]", out)
+        self.assertIn("{\\an2}", out)
+
+    def test_flash_line_is_bottom_center(self):
+        out = osd.sleep_flash_line("Sleep 60m", "#33CC33", 36)
+        self.assertIn("{\\an2}", out)
+        self.assertIn("Sleep 60m", out)
+
+    def test_countdown_rounds_up(self):
+        self.assertIn("Off in 1:00", osd.sleep_countdown_line(59.9, "#33CC33", 36))
+        self.assertIn("Off in 0:45", osd.sleep_countdown_line(45.0, "#33CC33", 36))
+        self.assertIn("Off in 0:00", osd.sleep_countdown_line(0.0, "#33CC33", 36))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -37,13 +37,13 @@ BUTTONS: dict[int, str] = {
     115: "vol-up",        # KEY_VOLUMEUP
     103: "channel-up",    # KEY_UP
     108: "channel-down",  # KEY_DOWN
-    105: "arrow-left",    # KEY_LEFT   (reserved, M3)
-    106: "arrow-right",   # KEY_RIGHT  (reserved, M3)
+    105: "arrow-left",    # KEY_LEFT   (sleep chooser: previous)
+    106: "arrow-right",   # KEY_RIGHT  (sleep chooser: next)
     28:  "ok",            # KEY_ENTER
     158: "back",          # KEY_BACK
     127: "menu",          # KEY_COMPOSE (reserved, M3)
     1:   "home",          # KEY_HOME    (reserved, M3; docs/remote.md says HOMEPAGE 172)
-    14:  "sun",           # KEY_BACKSPACE (reserved, M3)
+    14:  "sun",           # KEY_BACKSPACE (sleep timer)
     111: "screen-arrow",  # KEY_DELETE  (reserved, M3)
 }
 
@@ -62,12 +62,12 @@ COMMANDS: dict[str, Command | None] = {
     "power": Command.POWER,
     "ok": Command.INFO,
     "back": Command.BACK,
+    "sun": Command.SLEEP,
+    "arrow-left": Command.LEFT,
+    "arrow-right": Command.RIGHT,
     # Reserved (M3): recognized so they can be logged, but ignored.
-    "arrow-left": None,
-    "arrow-right": None,
     "menu": None,
     "home": None,
-    "sun": None,
     "screen-arrow": None,
 }
 
@@ -211,8 +211,8 @@ class Remote:
             return
         command = COMMANDS.get(name)
         if command is None:
-            # Reserved buttons (arrow, menu, home, sun, screen-arrow): ignored
-            # in the MVP but still recognized so they can be logged (SCOPE §4.4).
+            # Reserved buttons (menu, home, screen-arrow): ignored but still
+            # recognized so they can be logged (SCOPE §4.4).
             if is_press:
                 _log.debug("remote: %s ignored (reserved)", name)
             return

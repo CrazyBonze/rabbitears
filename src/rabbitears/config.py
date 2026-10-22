@@ -42,6 +42,15 @@ class Config:
     repeat_delay: float = 0.5
     # Seconds between repeats while held (invalid if < 0.1).
     repeat_interval: float = 0.4
+    # Sleep-timer presets in minutes (SCOPE §4.4 Sun): the chooser's options in
+    # cycle order; the chooser always appends "Off" as the final option.
+    # Must be non-empty positive ints (a bad value falls back to the default).
+    sleep_presets: list[int] = field(default_factory=lambda: [30, 60, 90])
+    # Seconds before the sleep deadline that the ticking countdown appears.
+    sleep_countdown: float = 60.0
+    # How long the sleep chooser stays open before it auto-dismisses (no change
+    # unless OK is pressed).
+    sleep_chooser_duration: float = 5.0
     # USB vendor ID the remote scan looks for (SCOPE §4.4: Adomax 0x0627).
     remote_vendor: int = 0x0627
     # Local root-only control socket (commands + read-only status).
@@ -87,6 +96,18 @@ def _as_int(value: object, default: int) -> int:
     if isinstance(value, int):
         return value
     return default
+
+
+def _as_int_list(value: object, default: list[int]) -> list[int]:
+    """Coerce to a list of positive ints, or ``default`` if not a list of them."""
+    if not isinstance(value, (list, tuple)):
+        return default
+    out: list[int] = []
+    for v in value:
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            return default
+        out.append(v)
+    return out
 
 
 def _as_str(value: object, default: str) -> str:
@@ -136,6 +157,15 @@ def load_config(path: Path = _DEFAULT_CONFIG_PATH) -> Config:
     osd_font_size = _as_int(data.get("osd_font_size"), _DEFAULTS.osd_font_size)
     if osd_font_size < 8:
         osd_font_size = _DEFAULTS.osd_font_size
+    sleep_presets = _as_int_list(data.get("sleep_presets"), _DEFAULTS.sleep_presets)
+    if not sleep_presets:
+        sleep_presets = _DEFAULTS.sleep_presets
+    sleep_countdown = _as_float(data.get("sleep_countdown"), _DEFAULTS.sleep_countdown)
+    if sleep_countdown <= 0:
+        sleep_countdown = _DEFAULTS.sleep_countdown
+    sleep_chooser_duration = _as_float(data.get("sleep_chooser_duration"), _DEFAULTS.sleep_chooser_duration)
+    if sleep_chooser_duration <= 0:
+        sleep_chooser_duration = _DEFAULTS.sleep_chooser_duration
 
     return Config(
         epoch=_as_float(data.get("epoch"), _DEFAULTS.epoch),
@@ -143,6 +173,9 @@ def load_config(path: Path = _DEFAULT_CONFIG_PATH) -> Config:
         volume_step=volume_step,
         repeat_delay=_as_float(data.get("repeat_delay"), _DEFAULTS.repeat_delay),
         repeat_interval=repeat_interval,
+        sleep_presets=sleep_presets,
+        sleep_countdown=sleep_countdown,
+        sleep_chooser_duration=sleep_chooser_duration,
         remote_vendor=_as_int(data.get("remote_vendor"), _DEFAULTS.remote_vendor),
         control_socket=_as_path(data.get("control_socket"), _DEFAULTS.control_socket),
         osd_color=_as_str(data.get("osd_color"), _DEFAULTS.osd_color),

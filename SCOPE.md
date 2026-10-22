@@ -133,12 +133,14 @@ which treats it as standby.
 | Button | evdev | Action |
 |---|---|---|
 | D-pad ↑ / ↓ | `KEY_UP` / `KEY_DOWN` | Channel up / down; app-side auto-repeat when held |
-| OK | `KEY_ENTER` | Toggle info overlay |
-| Back | `KEY_BACK` | Dismiss overlay |
+| D-pad ← / → | `KEY_LEFT` / `KEY_RIGHT` | Sleep chooser: previous / next option (§4.9) |
+| OK | `KEY_ENTER` | Toggle info overlay; confirm the highlighted sleep option |
+| Back | `KEY_BACK` | Dismiss overlay; close the chooser; cancel the sleep countdown |
 | VOL + / − | `KEY_VOLUMEUP` / `KEY_VOLUMEDOWN` | Volume, clamped to a max cap |
 | Mute | `KEY_MUTE` | Toggle mute |
 | Power | `KEY_POWER` | Standby ↔ on |
-| All others | — | Ignored in MVP (reserved, see §9) |
+| Sun | `KEY_BACKSPACE` | Open/advance the sleep-timer chooser (§4.9) |
+| All others | — | Ignored (reserved, see §9) |
 
 - Input: open every `/dev/input/event*` whose vendor is `0x0627` (scan in
   Python, no udev/by-id dependency), `grab()` them exclusively, and filter by
@@ -188,6 +190,21 @@ which treats it as standby.
 Power on → OpenRC starts `rabbitears` → mdev mounts the drive by label
 `RABBITEARS` on hotplug and at boot → tune to the last channel from
 `state.json`, or the lowest channel if there's no state → channel flash.
+
+### 4.9 Sleep timer
+- **Sun** opens the sleep chooser — a transient overlay listing the configured
+  presets plus `Off`, the current selection highlighted. Sun or → advances, ←
+  moves back, **OK** commits (arms the timer or turns it off), **Back** or a
+  ~5 s timeout closes it without change. The chooser is an info-overlay variant,
+  not a navigable menu (SCOPE §1 goal 3).
+- **Presets** are minutes from `sleep_presets` (default 30/60/90); the deadline
+  is `now + preset`. While a timer is armed, in its last `sleep_countdown`
+  seconds (default 60) a ticking `Off in 0:45` shows bottom-centre.
+- **During the countdown**, Sun reopens the chooser to pick a new length
+  (extend) or `Off`; **Back** cancels the timer outright. Other buttons keep
+  working normally — a kid flipping channels does not cancel the timer.
+- **At the deadline** the box enters standby (§4.6). The timer is session-only:
+  cleared on standby, NO SIGNAL, and boot — never persisted to `state.json`.
 
 ---
 
@@ -393,6 +410,7 @@ Ideas we want eventually but will **not** start before v1.0:
 | 2026-10-21 | One OSD font size for flash, overlay, and volume (`osd_font_size`, default 36) | the flash was 2× the overlay/volume, which looked inconsistent; 36 fits the three-line overlay and stays "large, thick" over composite |
 | 2026-10-21 | Volume and mute are independent controls (a volume press never unmutes) | the previous "volume press unmutes" made mute→VOL− blast the sound back on, reading as the two buttons cancelling each other; making them orthogonal (volume = level only, MUTE = sound only) is predictable and matches the kid-proof "nothing surprising happens" goal |
 | 2026-10-21 | The muted icon (crossed speaker + level) is persistent while muted | a 2.5s mute flash was too easy to miss; the mute state is part of the viewer's ongoing state, so it stays up until MUTE is pressed again |
+| 2026-10-21 | Sleep timer: Sun opens a transient chooser; OK commits, Back cancels | a single-button cycle has an overshoot problem (reaching 90 from off re-arms 30 and 60 along the way); a transient, auto-dismissing chooser gives explicit pick-then-confirm without adding a navigable menu (SCOPE §1 goal 3). Left/Right get their first job as chooser navigation |
 
 ## 11. Open questions
 - 8GB or 16GB eMMC on each unit? (Affects apk cache headroom.)

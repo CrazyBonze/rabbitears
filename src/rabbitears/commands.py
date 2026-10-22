@@ -24,8 +24,11 @@ class Command(enum.Enum):
     VOLUME_DOWN = "volume_down"
     MUTE = "mute"        # toggle
     POWER = "power"      # toggle standby
-    INFO = "info"        # toggle info overlay (M4)
-    BACK = "back"        # dismiss overlay (M4)
+    INFO = "info"        # toggle info overlay (M4); confirm in the sleep chooser
+    BACK = "back"        # dismiss overlay (M4); cancel the sleep chooser/timer
+    SLEEP = "sleep"      # open/advance the sleep-timer chooser (Sun)
+    LEFT = "left"        # sleep chooser: previous option
+    RIGHT = "right"      # sleep chooser: next option
 
 
 def parse_command(text: str) -> Command | None:

@@ -42,6 +42,9 @@ class CommandValuesTest(unittest.TestCase):
         self.assertEqual(Command.POWER.value, "power")
         self.assertEqual(Command.INFO.value, "info")
         self.assertEqual(Command.BACK.value, "back")
+        self.assertEqual(Command.SLEEP.value, "sleep")
+        self.assertEqual(Command.LEFT.value, "left")
+        self.assertEqual(Command.RIGHT.value, "right")
 
 
 if __name__ == "__main__":

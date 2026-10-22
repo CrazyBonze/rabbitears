@@ -53,17 +53,18 @@ No QWERTY keyboard.
   every `/dev/input/event*` whose vendor is `0x0627` and opens all matching
   interfaces (the buttons are split across them).
 
-## 4. Rabbit Ears role mapping (SCOPE §4.4)
+## 4. Rabbit Ears role mapping (SCOPE §4.4, §4.9)
 
 | Button | Action |
 |---|---|
 | D-pad ↑ / ↓ | Channel up / down (hold to auto-repeat) |
-| OK | Toggle info overlay |
-| Back | Dismiss overlay |
-| VOL + / − | Volume up / down (clamped; a press unmutes) |
+| D-pad ← / → | Sleep chooser: previous / next option |
+| OK | Toggle info overlay; confirm the highlighted sleep option |
+| Back | Dismiss overlay; close the chooser; cancel the sleep countdown |
+| VOL + / − | Volume up / down (clamped; never unmutes — mute is independent) |
 | Mute | Toggle mute |
 | Power | Standby ↔ on |
+| Sun | Open/advance the sleep-timer chooser |
 
-**Reserved — recognised but ignored in the MVP:** D-pad ← / →, Home, Menu, Sun,
-Screen-arrow, Mouse (gyro). They are logged and skipped; only the six rows above
-have an effect (SCOPE §4.4 "All others: ignored").
+**Reserved — recognised but ignored:** Home, Menu, Screen-arrow, Mouse (gyro).
+They are logged and skipped (SCOPE §4.4 "All others: ignored").

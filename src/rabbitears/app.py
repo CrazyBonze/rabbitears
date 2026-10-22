@@ -187,6 +187,18 @@ class App:
         self._overlay_until = 0.0  # info overlay auto-dismiss deadline (0 = none)
         self._flash_until = 0.0
         self._volume_until = 0.0
+        # Sleep timer (SCOPE §4.4 Sun): chooser + armed timer, all in-memory and
+        # session-only (cleared on standby/no-signal, like mute). _sleep_index is
+        # the armed preset index (None = off); _sleep_until is the wall-clock
+        # deadline (0 = none). The chooser and the armed timer are independent:
+        # opening the chooser never disturbs a running timer until OK commits.
+        self._sleep_index: int | None = None
+        self._sleep_until = 0.0
+        self._sleep_chooser_open = False
+        self._sleep_chooser_until = 0.0
+        self._sleep_selection = 0
+        self._sleep_flash_until = 0.0
+        self._sleep_updated_at = 0.0
         # Remote input (SCOPE §4.4): the app is the FIFO reader and the only
         # process that acts on a button. Disabled if the FIFO can't be opened.
         self._buttons_fd: int | None = None
@@ -336,6 +348,9 @@ class App:
             _log.warning("media removed — NO SIGNAL")
             self._enter_no_signal()
             return
+        if self._sleep_until and not self._sleep_chooser_open and now >= self._sleep_until:
+            self._fire_sleep()
+            return
         self._step_osd(now)
         if self.player.is_idle():
             since_load = now - self._load_time
@@ -372,6 +387,9 @@ class App:
         elif command is Command.MUTE:
             self._mute(source)
         elif command is Command.INFO:
+            if self._sleep_chooser_open:
+                self._commit_sleep(source)
+                return
             if self._mode != "PLAYING":
                 _log.info("%s: %s ignored (no signal)", source, command.value)
                 return
@@ -379,11 +397,31 @@ class App:
                 self._dismiss_overlay(source, command)
             else:
                 self._show_overlay(source)
-        else:  # BACK
+        elif command is Command.BACK:
+            if self._sleep_chooser_open:
+                self._close_sleep_chooser()
+                self._render_osd()
+                _log.info("%s: sleep chooser closed", source)
+                return
+            if self._in_sleep_countdown(self.clock()):
+                self._cancel_sleep(source)
+                return
             if not self._overlay_shown:
                 _log.info("%s: %s ignored (nothing to dismiss)", source, command.value)
                 return
             self._dismiss_overlay(source, command)
+        elif command is Command.SLEEP:
+            if self._mode != "PLAYING":
+                _log.info("%s: %s ignored (no signal)", source, command.value)
+                return
+            self._sleep(source)
+        elif command in (Command.LEFT, Command.RIGHT):
+            if not self._sleep_chooser_open:
+                _log.info("%s: %s ignored (no chooser)", source, command.value)
+                return
+            self._nudge_sleep_selection(1 if command is Command.RIGHT else -1)
+        else:  # pragma: no cover - every Command member is handled above
+            _log.warning("%s: unhandled command %s", source, command.value)
 
     def _power(self, source: str) -> None:
         """Toggle standby (SCOPE §4.6): hide video + mute; wake re-tunes."""
@@ -399,11 +437,24 @@ class App:
                 self.player.show_image(self.config.testpattern_path)
             _log.info("%s: power on", source)
         else:
-            self._standby = True
-            self._clear_overlay("standby")
-            self.player.hide_video()
-            self.player.set_mute(True)
+            self._enter_standby("standby")
             _log.info("%s: power standby", source)
+
+    def _enter_standby(self, reason: str) -> None:
+        """Enter standby (SCOPE §4.6): hide video + mute, and clear the sleep timer.
+
+        Shared by Power and the sleep timer's deadline. Standby ends the sleep
+        timer's job (the box is already "off"), so the timer is cleared here.
+        """
+        self._standby = True
+        self._sleep_index = None
+        self._sleep_until = 0.0
+        self._sleep_chooser_open = False
+        self._sleep_chooser_until = 0.0
+        self._sleep_flash_until = 0.0
+        self._clear_overlay(reason)
+        self.player.hide_video()
+        self.player.set_mute(True)
 
     def _volume(self, delta: int, source: str, command: Command) -> None:
         new = max(0, min(self.config.volume_cap, self.state.volume + delta))
@@ -435,6 +486,93 @@ class App:
         press never wipes a channel flash that is still showing.
         """
         self._render_osd()
+
+    # -- sleep timer (SCOPE §4.4 Sun) ---------------------------------------
+
+    def _sleep_label(self) -> str:
+        """The armed sleep state as a label: ``30m``/``60m``/``90m``/``Off``."""
+        if self._sleep_index is None:
+            return "Off"
+        return f"{self.config.sleep_presets[self._sleep_index]}m"
+
+    def _sleep_options(self) -> list[str]:
+        """The chooser's options: every preset, then ``Off``."""
+        return [f"{m}m" for m in self.config.sleep_presets] + ["Off"]
+
+    def _in_sleep_countdown(self, now: float) -> bool:
+        """True while a timer is armed, not currently choosing, and inside the
+        pre-fire countdown window."""
+        return (
+            self._sleep_until > 0.0
+            and not self._sleep_chooser_open
+            and now >= self._sleep_until - self.config.sleep_countdown
+        )
+
+    def _sleep_remaining(self) -> float | None:
+        """Seconds until the timer fires, or None when no timer is armed."""
+        if self._sleep_until <= 0.0:
+            return None
+        return max(0.0, self._sleep_until - self.clock())
+
+    def _open_sleep_chooser(self, source: str) -> None:
+        """Sun: open the chooser, starting on the current preset (or the first)."""
+        self._sleep_chooser_open = True
+        self._sleep_chooser_until = self.clock() + self.config.sleep_chooser_duration
+        self._sleep_selection = self._sleep_index if self._sleep_index is not None else 0
+        self._render_osd()
+        _log.info("%s: sleep chooser open (selection %d)", source, self._sleep_selection)
+
+    def _nudge_sleep_selection(self, delta: int) -> None:
+        """Move the chooser highlight by ``delta`` (wraps around; keeps it alive)."""
+        n = len(self.config.sleep_presets) + 1
+        self._sleep_selection = (self._sleep_selection + delta) % n
+        self._sleep_chooser_until = self.clock() + self.config.sleep_chooser_duration
+        self._render_osd()
+
+    def _close_sleep_chooser(self) -> None:
+        """Close the chooser without touching the armed timer (no render)."""
+        self._sleep_chooser_open = False
+        self._sleep_chooser_until = 0.0
+
+    def _commit_sleep(self, source: str) -> None:
+        """OK in the chooser: arm the highlighted preset, or ``Off`` disarms."""
+        presets = self.config.sleep_presets
+        if self._sleep_selection < len(presets):
+            self._sleep_index = self._sleep_selection
+            self._sleep_until = self.clock() + presets[self._sleep_selection] * 60.0
+            _log.info("%s: sleep %s", source, self._sleep_label())
+        else:
+            self._sleep_index = None
+            self._sleep_until = 0.0
+            _log.info("%s: sleep off", source)
+        self._close_sleep_chooser()
+        self._flash_sleep(f"Sleep {self._sleep_label()}")
+
+    def _flash_sleep(self, text: str) -> None:
+        """Show the transient ``Sleep 60m``/``Sleep Off`` confirmation."""
+        self._sleep_flash_until = self.clock() + self.config.osd_duration
+        self._render_osd()
+
+    def _cancel_sleep(self, source: str) -> None:
+        """Back during the countdown: disarm the timer (and any chooser)."""
+        self._sleep_index = None
+        self._sleep_until = 0.0
+        self._sleep_chooser_open = False
+        self._sleep_chooser_until = 0.0
+        self._sleep_flash_until = 0.0
+        self._render_osd()
+        _log.info("%s: sleep cancelled", source)
+
+    def _sleep(self, source: str) -> None:
+        """Sun: advance the open chooser, or open it."""
+        if self._sleep_chooser_open:
+            self._nudge_sleep_selection(1)
+        else:
+            self._open_sleep_chooser(source)
+
+    def _fire_sleep(self) -> None:
+        _log.info("sleep timer: deadline reached")
+        self._enter_standby("sleep timer")
 
     def _zap(self, direction: int, source: str, command: Command) -> None:
         """Tune to the next/prev playable channel in `direction`, skipping empties.
@@ -589,6 +727,23 @@ class App:
             and self._last_loaded_path is not None
         ):
             lines.append(self._info_block_line())
+        # Sleep timer (SCOPE §4.4 Sun): the chooser takes priority over the
+        # countdown, which takes priority over the transient confirmation.
+        if self._sleep_chooser_open:
+            lines.append(osd_mod.sleep_chooser_line(
+                self._sleep_options(), self._sleep_selection,
+                self.config.osd_color, self.config.osd_font_size,
+            ))
+        elif self._in_sleep_countdown(now):
+            lines.append(osd_mod.sleep_countdown_line(
+                self._sleep_until - now,
+                self.config.osd_color, self.config.osd_font_size,
+            ))
+        elif self._sleep_flash_until > now:
+            lines.append(osd_mod.sleep_flash_line(
+                f"Sleep {self._sleep_label()}",
+                self.config.osd_color, self.config.osd_font_size,
+            ))
         return lines
 
     def _info_block_line(self) -> str:
@@ -618,6 +773,8 @@ class App:
             self.player.show_osd_text(osd_mod.compose_osd(*lines))
             if self._overlay_shown:
                 self._overlay_updated_at = now
+            if self._in_sleep_countdown(now):
+                self._sleep_updated_at = now
         else:
             self.player.clear_osd()
 
@@ -662,6 +819,14 @@ class App:
         if self._volume_until and now >= self._volume_until:
             self._volume_until = 0.0
             changed = True
+        if self._sleep_flash_until and now >= self._sleep_flash_until:
+            self._sleep_flash_until = 0.0
+            changed = True
+        if self._sleep_chooser_open and now >= self._sleep_chooser_until:
+            self._sleep_chooser_open = False
+            self._sleep_chooser_until = 0.0
+            changed = True
+            _log.info("sleep chooser closed (timeout)")
         if self._overlay_shown and self._overlay_until and now >= self._overlay_until:
             self._overlay_shown = False
             self._overlay_until = 0.0
@@ -670,6 +835,8 @@ class App:
         if changed:
             self._render_osd()
         if self._overlay_shown and now - self._overlay_updated_at >= 1.0:
+            self._render_osd()
+        if self._in_sleep_countdown(now) and now - self._sleep_updated_at >= 1.0:
             self._render_osd()
 
     def _save_state(self) -> None:
@@ -691,6 +858,7 @@ class App:
             "muted": self._muted,
             "overlay": self._overlay_shown,
             "remaining": self._remaining_seconds(),
+            "sleep": self._sleep_remaining(),
         }
 
     # -- unplayable-file handling ------------------------------------------
@@ -723,6 +891,11 @@ class App:
     def _enter_no_signal(self) -> None:
         self._mode = "NO_SIGNAL"
         self._clear_overlay("no signal")
+        self._sleep_index = None
+        self._sleep_until = 0.0
+        self._sleep_chooser_open = False
+        self._sleep_chooser_until = 0.0
+        self._sleep_flash_until = 0.0
         self._current = None
         self._playlist = []
         self._last_loaded_path = None

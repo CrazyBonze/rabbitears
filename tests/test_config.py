@@ -220,5 +220,45 @@ class OsdRangeChecksTest(unittest.TestCase):
             self.assertEqual(load_config(path).osd_font_size, 8)
 
 
+class SleepConfigTest(unittest.TestCase):
+    def test_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = load_config(Path(tmp) / "nope.toml")
+            self.assertEqual(cfg.sleep_presets, [30, 60, 90])
+            self.assertEqual(cfg.sleep_countdown, 60.0)
+            self.assertEqual(cfg.sleep_chooser_duration, 5.0)
+
+    def test_override_preserves_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                "sleep_presets = [15, 30]\n"
+                "sleep_countdown = 30.0\n"
+                "sleep_chooser_duration = 8.0\n"
+            )
+            cfg = load_config(path)
+            self.assertEqual(cfg.sleep_presets, [15, 30])
+            self.assertEqual(cfg.sleep_countdown, 30.0)
+            self.assertEqual(cfg.sleep_chooser_duration, 8.0)
+
+    def test_non_positive_preset_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("sleep_presets = [30, 0]\n")
+            self.assertEqual(load_config(path).sleep_presets, [30, 60, 90])
+
+    def test_non_list_presets_fall_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text('sleep_presets = "30,60"\n')
+            self.assertEqual(load_config(path).sleep_presets, [30, 60, 90])
+
+    def test_negative_countdown_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("sleep_countdown = -5.0\n")
+            self.assertEqual(load_config(path).sleep_countdown, 60.0)
+
+
 if __name__ == "__main__":
     unittest.main()

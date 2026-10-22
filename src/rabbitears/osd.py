@@ -29,6 +29,7 @@ produce the same-sized text.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 # ASS stores colour as &HBBGGRR& (BGR, not RGB). The default is the config
@@ -200,3 +201,35 @@ def info_block(
         f"{ass_escape(title_line)}\\N"
         f"{remaining_line}"
     )
+
+
+# --- sleep timer (SCOPE §4.4 Sun) ----------------------------------------
+
+def sleep_chooser_line(
+    options: list[str], selected: int, color: object, font_size: object
+) -> str:
+    """The sleep chooser (bottom-centre ``\\an2``): one horizontal option list
+    with the selected option bracketed. Brackets, not colour, so the highlight
+    reads over composite on a CRT (SCOPE §4.5).
+    """
+    labels = [f"[{o}]" if i == selected else o for i, o in enumerate(options)]
+    body = ass_escape("   ".join(labels))
+    return f"{{\\an2}}{_style(color, font_size)}{body}"
+
+
+def sleep_flash_line(text: str, color: object, font_size: object) -> str:
+    """The transient ``Sleep 60m`` / ``Sleep Off`` confirmation (bottom-centre)."""
+    return f"{{\\an2}}{_style(color, font_size)}{ass_escape(text)}"
+
+
+def sleep_countdown_line(
+    seconds_left: float, color: object, font_size: object
+) -> str:
+    """The ticking ``Off in 0:45`` countdown (bottom-centre, ``\\an2``).
+
+    Rounds up to whole seconds so it shows ``1:00`` at the moment the window
+    opens and never renders ``0:00`` (that instant fires, not renders).
+    """
+    total = max(0, math.ceil(seconds_left))
+    m, s = divmod(total, 60)
+    return f"{{\\an2}}{_style(color, font_size)}Off in {m}:{s:02d}"

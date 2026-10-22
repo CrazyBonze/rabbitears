@@ -59,7 +59,10 @@ class ParseLineTest(unittest.TestCase):
         self.assertIs(R.COMMANDS["power"], Command.POWER)
         self.assertIs(R.COMMANDS["ok"], Command.INFO)
         self.assertIs(R.COMMANDS["back"], Command.BACK)
-        for name in ("arrow-left", "arrow-right", "menu", "home", "sun", "screen-arrow"):
+        self.assertIs(R.COMMANDS["sun"], Command.SLEEP)
+        self.assertIs(R.COMMANDS["arrow-left"], Command.LEFT)
+        self.assertIs(R.COMMANDS["arrow-right"], Command.RIGHT)
+        for name in ("menu", "home", "screen-arrow"):
             self.assertIsNone(R.COMMANDS[name])
 
 
@@ -196,14 +199,18 @@ class RemoteTest(unittest.TestCase):
         remote.handle("power")
         remote.handle("ok")
         remote.handle("back")
+        remote.handle("sun")
+        remote.handle("arrow-left")
+        remote.handle("arrow-right")
         self.assertEqual(calls, [
             Command.CHANNEL_UP, Command.VOLUME_DOWN, Command.MUTE,
-            Command.POWER, Command.INFO, Command.BACK,
+            Command.POWER, Command.INFO, Command.BACK, Command.SLEEP,
+            Command.LEFT, Command.RIGHT,
         ])
 
     def test_reserved_buttons_not_forwarded(self):
         remote, calls = self._remote()
-        for name in ("arrow-left", "arrow-right", "menu", "home", "sun", "screen-arrow"):
+        for name in ("menu", "home", "screen-arrow"):
             remote.handle(name)
         self.assertEqual(calls, [])
 
